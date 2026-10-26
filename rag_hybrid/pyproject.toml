@@ -7,7 +7,7 @@ name = "rag_hybrid"
 version = "0.1.0"
 description = "Hybrid Retrieval‑Augmented Generation with evaluation harness"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 license = {text = "Apache-2.0"}
 authors = [{name = "Your Name", email = "you@example.com"}]
 dependencies = [
@@ -18,12 +18,38 @@ dependencies = [
     "torch",
     "transformers",
     "qdrant-client",
+    "pinecone",
     "elasticsearch",
-    "openai",
+    "groq",
+    "rank-bm25",
     "tiktoken",
     "ragas",
-    "rich"
+    "rich",
+    "streamlit",
+    "python-dotenv",
+    "requests",
 ]
 
 [project.urls]
 Homepage = "https://github.com/yourorg/rag_hybrid"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov",
+    "httpx",       # required by FastAPI TestClient
+    "numpy",
+    "ruff",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-vv --tb=short"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+ignore = ["E501"]

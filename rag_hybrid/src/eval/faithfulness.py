@@ -6,7 +6,8 @@ and a mapping from ``chunk_id`` to the parent text that was supplied to the gene
 It returns a deterministic ``CitationVerificationResult``.
 """
 
-from typing import List, Dict
+from typing import Dict, List
+
 from pydantic import BaseModel
 from sentence_transformers import CrossEncoder
 

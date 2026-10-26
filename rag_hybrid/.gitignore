@@ -1,1 +1,92 @@
+# ==============================================================================
+# Environment variables and secrets (NEVER commit these)
+# ==============================================================================
+.env
+.env.*
+*.env
 src/.env
+! .env.example
+*.pem
+*.key
+credentials.json
+token.json
+
+# ==============================================================================
+# Python bytecode and caches
+# ==============================================================================
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+
+# ==============================================================================
+# Virtual environments
+# ==============================================================================
+.venv/
+venv/
+ENV/
+env/
+env.bak/
+venv.bak/
+
+# ==============================================================================
+# Distribution, builds, packaging
+# ==============================================================================
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# ==============================================================================
+# Testing, coverage, and linting caches
+# ==============================================================================
+.pytest_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.tox/
+.nox/
+.ruff_cache/
+eval_output.txt
+
+# ==============================================================================
+# Local data, vector DB caches, and embedding stores
+# ==============================================================================
+chunks/
+embeddings/
+qdrant_storage/
+local_vector_db/
+documentation/
+
+# Local ingested raw documents (keep sample or .gitkeep)
+data/*
+!data/.gitkeep
+!data/sample.txt
+
+# ==============================================================================
+# IDE, editor, and OS files
+# ==============================================================================
+.vscode/
+!.vscode/settings.json
+.idea/
+*.swp
+*.swo
+*~
+
+.DS_Store
+Thumbs.db
+desktop.ini

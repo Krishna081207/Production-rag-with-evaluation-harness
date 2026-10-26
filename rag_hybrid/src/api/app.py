@@ -10,15 +10,17 @@ POST /query
 """
 
 import re
+
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
+
+from rag_hybrid.src.eval.faithfulness import FaithfulnessEvaluator
+from rag_hybrid.src.generator.generator import generate_answer
 
 # Local imports – the repository root is added to ``PYTHONPATH`` when the
 # package is installed in editable mode (``pip install -e .``).  Therefore we
 # can import using the top‑level ``rag_hybrid`` package name.
-from rag_hybrid.src.retriever.hybrid import ProductionHybridRAG, DocumentChunk
-from rag_hybrid.src.generator.generator import generate_answer
-from rag_hybrid.src.eval.faithfulness import FaithfulnessEvaluator
+from rag_hybrid.src.retriever.hybrid import ProductionHybridRAG
 
 app = FastAPI(title="rag_hybrid API", version="0.1.0")
 

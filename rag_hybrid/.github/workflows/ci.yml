@@ -1,0 +1,181 @@
+name: CI – Test · Lint · Eval
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+
+env:
+  PYTHON_VERSION: "3.11"
+
+jobs:
+  # ──────────────────────────────────────────────────────────────────────────
+  # 1. Lint
+  # ──────────────────────────────────────────────────────────────────────────
+  lint:
+    name: Lint (ruff)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install ruff
+        run: pip install ruff
+
+      - name: Run ruff
+        run: ruff check . --output-format=github
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # 2. Unit + integration tests with coverage
+  # ──────────────────────────────────────────────────────────────────────────
+  test:
+    name: Tests (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    needs: lint
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: [ "3.10", "3.11" ]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      # Cache heavy model downloads (sentence-transformers, cross-encoder)
+      - name: Cache Hugging Face models
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: hf-models-${{ runner.os }}-${{ matrix.python-version }}-${{ hashFiles('pyproject.toml') }}
+          restore-keys: |
+            hf-models-${{ runner.os }}-${{ matrix.python-version }}-
+
+      - name: Install project with dev extras
+        run: |
+          pip install --upgrade pip
+          pip install -e .[dev]
+
+      - name: Run tests with coverage
+        env:
+          GROQ_API_KEY: ${{ secrets['GROQ_API_KEY'] }}
+          PINECONE_API_KEY: ${{ secrets['PINECONE_API_KEY'] }}
+        run: |
+          pytest -vv \
+            --tb=short \
+            --cov=rag_hybrid \
+            --cov-report=term-missing \
+            --cov-report=xml:coverage.xml \
+            -p no:warnings
+
+      - name: Upload coverage report
+        if: matrix.python-version == '3.11'
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage.xml
+          retention-days: 7
+
+      # Optional: post coverage comment on PRs (requires codecov token secret)
+      - name: Upload to Codecov
+        if: matrix.python-version == '3.11' && github.event_name == 'push'
+        uses: codecov/codecov-action@v4
+        with:
+          files: coverage.xml
+          fail_ci_if_error: false
+          token: ${{ secrets['CODECOV_TOKEN'] }}
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # 3. Evaluation harness (hallucination rate + MMR)
+  # ──────────────────────────────────────────────────────────────────────────
+  evaluate:
+    name: Evaluation harness
+    runs-on: ubuntu-latest
+    needs: test
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Cache Hugging Face models
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: hf-models-${{ runner.os }}-eval-${{ hashFiles('pyproject.toml') }}
+          restore-keys: |
+            hf-models-${{ runner.os }}-eval-
+
+      - name: Install project
+        run: |
+          pip install --upgrade pip
+          pip install -e .[dev]
+
+      - name: Run evaluation harness
+        env:
+          GROQ_API_KEY: ${{ secrets['GROQ_API_KEY'] }}
+          PINECONE_API_KEY: ${{ secrets['PINECONE_API_KEY'] }}
+        run: python scripts/evaluate_harness.py | tee eval_output.txt
+
+      # Gate: fail CI if hallucination rate exceeds 50 % on any sample query
+      - name: Assert hallucination gate
+        run: |
+          python - <<'EOF'
+          import re, sys
+
+          with open("eval_output.txt") as f:
+              text = f.read()
+
+          rates = [float(m) for m in re.findall(r"Hallucination rate:\s+([\d.]+)%", text)]
+          if not rates:
+              print("No hallucination rates found – check harness output.")
+              sys.exit(1)
+
+          failed = [r for r in rates if r > 50.0]
+          if failed:
+              print(f"FAIL: hallucination rates above threshold: {failed}")
+              sys.exit(1)
+
+          print(f"PASS: all hallucination rates within threshold: {rates}")
+          EOF
+
+      - name: Upload eval output
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-output
+          path: eval_output.txt
+          retention-days: 14
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # 4. Docker build smoke-test
+  # ──────────────────────────────────────────────────────────────────────────
+  docker:
+    name: Docker build
+    runs-on: ubuntu-latest
+    needs: test
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image (no push)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: false
+          tags: rag_hybrid:ci-${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

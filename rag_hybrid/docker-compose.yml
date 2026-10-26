@@ -1,0 +1,28 @@
+version: '3.8'
+
+services:
+  api:
+    build: .
+    container_name: rag_hybrid_api
+    command: uvicorn rag_hybrid.src.api.app:app --host 0.0.0.0 --port 8000
+    ports:
+      - "8000:8000"
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+    volumes:
+      - .:/app
+    restart: unless-stopped
+
+  streamlit:
+    build: .
+    container_name: rag_hybrid_streamlit
+    command: streamlit run scripts/app_streamlit.py --server.port 8501 --server.address 0.0.0.0
+    ports:
+      - "8501:8501"
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+    volumes:
+      - .:/app
+    depends_on:
+      - api
+    restart: unless-stopped

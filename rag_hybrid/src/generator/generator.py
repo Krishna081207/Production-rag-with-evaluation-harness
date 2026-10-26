@@ -7,38 +7,51 @@ The generator follows a strict citation contract:
 """
 
 import os
-from typing import List, Dict
+from typing import List
+
+# Load environment variables (requires python-dotenv in dependencies)
+from dotenv import load_dotenv
 from pydantic import BaseModel
 
 from rag_hybrid.src.retriever.hybrid import DocumentChunk
 
+load_dotenv()
+
+# Groq client – ensure groq SDK is installed.
+try:
+    from groq import Groq
+except ImportError as e:
+    raise ImportError("Groq SDK not installed. Add 'groq' to pyproject dependencies.") from e
 
 class GenerationResult(BaseModel):
     answer: str
     citations: List[str]
 
+def _build_prompt(query: str, chunks: List[DocumentChunk]) -> str:
+    """Create a prompt that enforces the citation contract.
 
-def assemble_context(chunks: List[DocumentChunk]) -> str:
-    """Create a single context string from the parent chunks.
-    The parent_text provides enough surrounding material for the LLM.
+    The prompt includes the user query and the parent texts of the supplied chunks.
     """
-    # Preserve order; here we simply join unique parent texts.
-    seen = set()
-    parts = []
-    for c in chunks:
-        if c.parent_text not in seen:
-            seen.add(c.parent_text)
-            parts.append(c.parent_text)
-    return "\n\n".join(parts)
+    context = "\n\n".join(chunk.parent_text for chunk in chunks)
+    return f"""You are a factual assistant. Answer the user's question using ONLY the provided context. Cite each factual sentence with the corresponding chunk identifier in the form [Chunk_<ID>].
 
+User query: {query}
+
+Context:
+{context}
+
+If the context does not contain sufficient information, respond with: \"The provided documentation does not contain sufficient evidence to answer this inquiry.\"
+"""
 
 def generate_answer(query: str, retrieved_chunks: List[DocumentChunk]) -> GenerationResult:
-    """Generate a grounded answer for *query*.
+    """Generate a grounded answer using Groq LLM.
 
-    For demonstration purposes we use a very simple rule‑based stub:
-    - If at least one chunk is retrieved, we concatenate the first two sentences
-      from the first parent chunk and append the appropriate citation.
-    - If no chunks are found we return the fallback message.
+    Parameters
+    ----------
+    query: str
+        User question.
+    retrieved_chunks: List[DocumentChunk]
+        Ranked chunks from the hybrid retriever.
     """
     if not retrieved_chunks:
         return GenerationResult(
@@ -46,13 +59,25 @@ def generate_answer(query: str, retrieved_chunks: List[DocumentChunk]) -> Genera
             citations=[],
         )
 
-    # Use the parent text of the top‑ranked chunk as context.
-    parent_text = retrieved_chunks[0].parent_text
-    # Simple split into sentences (naïve). Take first two sentences.
-    sentences = [s.strip() for s in parent_text.split('.') if s]
-    selected = ". ".join(sentences[:2])
-    if selected:
-        selected = selected.strip() + "."
-    citation = f"[Chunk_{retrieved_chunks[0].chunk_id}]"
-    answer = f"{selected} {citation}"
-    return GenerationResult(answer=answer, citations=[citation])
+    # Build prompt from top‑N chunks (use all provided)
+    prompt = _build_prompt(query, retrieved_chunks)
+
+    client = Groq(api_key=os.getenv("GROQ_API_KEY") or os.getenv("groq"))
+    try:
+        response = client.chat.completions.create(
+            model="llama3-70b-instruct",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.0,
+            max_tokens=1024,
+        )
+        answer_text = response.choices[0].message.content.strip()
+    except Exception as e:
+        answer_text = "The provided documentation does not contain sufficient evidence to answer this inquiry."
+        print(f"Groq API error: {e}")
+
+    # Extract citations (Chunk_<ID>) from the answer
+    import re
+    found = re.findall(r"\[Chunk_([^\]]+)\]", answer_text)
+    citations = [f"Chunk_{c}" for c in found]
+
+    return GenerationResult(answer=answer_text, citations=citations)
