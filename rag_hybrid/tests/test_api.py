@@ -47,6 +47,34 @@ class TestHealthEndpoint:
         assert resp.json() == {"status": "ok"}
 
 
+class TestDocumentUpload:
+    @patch("rag_hybrid.src.api.app._rag")
+    def test_upload_indexes_documents(self, mock_rag, client):
+        mock_rag.corpus_chunks = [object(), object()]
+        mock_rag.append_documents.return_value = None
+
+        resp = client.post(
+            "/documents",
+            files={"files": ("notes.txt", b"Python is used for testing.", "text/plain")},
+        )
+
+        assert resp.status_code == 200
+        assert resp.json() == {
+            "files": ["notes.txt"],
+            "chunks_indexed": 1,
+            "total_chunks": 2,
+        }
+        mock_rag.append_documents.assert_called_once()
+
+
+def test_extract_claims_ignores_citation_free_fallback():
+    from rag_hybrid.src.api.app import _extract_claims
+
+    assert _extract_claims(
+        "The provided documentation does not contain sufficient evidence to answer this inquiry."
+    ) == []
+
+
 # ---------------------------------------------------------------------------
 # /query – input validation
 # ---------------------------------------------------------------------------

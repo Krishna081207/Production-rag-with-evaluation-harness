@@ -125,6 +125,8 @@ class TestGenerateAnswerWithMockedGroq:
         result = generate_answer("What is Python?", two_chunks)
         assert isinstance(result, GenerationResult)
         assert isinstance(result.answer, str)
+        assert result.citations == ["Chunk_c1"]
+        assert "[Chunk_c1]" in result.answer
 
     @patch("rag_hybrid.src.generator.generator.Groq")
     def test_citation_regex_handles_multiword_id(self, MockGroq, two_chunks):
