@@ -127,6 +127,18 @@ st.markdown(
 # ---------------------------------------------------------------------------
 # Sidebar – configuration
 # ---------------------------------------------------------------------------
+#upload documents
+st.markdown("## 📂 Upload Documents")
+stfile = st.file_uploader(
+    "Upload documents",
+    type=["pdf", "txt", "md", "docx"],
+    accept_multiple_files=True,
+)
+index_uploads = st.button(
+    "Index uploaded documents",
+    disabled=not stfile,
+    help="Parse, chunk, embed, and store the selected documents for search.",
+)
 with st.sidebar:
     st.image(
         "https://raw.githubusercontent.com/simple-icons/simple-icons/develop/icons/openai.svg",
@@ -219,6 +231,20 @@ def call_api(q: str) -> dict:
     return resp.json()
 
 
+def upload_documents(files: list) -> dict:
+    """Send selected files to the API ingestion pipeline."""
+    payload = [
+        ("files", (file.name, file.getvalue(), file.type or "application/octet-stream"))
+        for file in files
+    ]
+    resp = requests.post(
+        f"{api_url.rstrip('/')}/documents",
+        files=payload,
+        timeout=120,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
 # ---------------------------------------------------------------------------
 # Helper: inline pipeline (no server required)
 # ---------------------------------------------------------------------------
@@ -265,9 +291,11 @@ def call_inline(q: str, vector_db: str = "pinecone") -> dict:
     gen_res = generate_answer(q, retrieved)
     retrieved_map = {c.chunk_id: c.parent_text for c in retrieved}
     match = _re.search(r"\[Chunk_(?P<cid>[^\]]+)\]", gen_res.answer)
-    citation = f"Chunk_{match.group('cid')}" if match else ""
-    claim = gen_res.answer.replace(match.group(0), "").strip() if match else gen_res.answer
-    claims = [{"claim": claim, "citation": citation}]
+    claims = []
+    if match:
+        citation = f"Chunk_{match.group('cid')}"
+        claim = gen_res.answer.replace(match.group(0), "").strip()
+        claims.append({"claim": claim, "citation": citation})
     eval_res = evaluator.evaluate_generation(claims, retrieved_map)
     return {
         "answer": gen_res.answer,
@@ -275,6 +303,46 @@ def call_inline(q: str, vector_db: str = "pinecone") -> dict:
         "faithfulness_score": eval_res.faithfulness_score,
         "violations": eval_res.violations or None,
     }
+
+
+def index_inline_documents(files: list) -> dict:
+    """Parse and index selected documents in the cached inline pipeline."""
+    from rag_hybrid.src.ingestion import chunk_document, read_document_bytes
+
+    rag, _, _, _ = _load_inline_pipeline(vdb_choice)
+    all_chunks = []
+    indexed_files = []
+    for file in files:
+        chunks = chunk_document(file.name, read_document_bytes(file.name, file.getvalue()))
+        if not chunks:
+            raise ValueError(f"{file.name}: document is empty")
+        indexed_files.append(file.name)
+        all_chunks.extend(chunks)
+    rag.append_documents(all_chunks)
+    return {
+        "files": indexed_files,
+        "chunks_indexed": len(all_chunks),
+        "total_chunks": len(rag.corpus_chunks),
+    }
+
+
+if index_uploads:
+    with st.spinner("Parsing, chunking, embedding, and indexing…"):
+        try:
+            upload_result = (
+                upload_documents(stfile)
+                if mode == "API (FastAPI)"
+                else index_inline_documents(stfile)
+            )
+            st.success(
+                f"Indexed {upload_result['chunks_indexed']} chunks from "
+                f"{len(upload_result['files'])} document(s). "
+                f"Total indexed chunks: {upload_result['total_chunks']}."
+            )
+        except requests.RequestException as exc:
+            st.error(f"Document indexing failed: {exc}")
+        except (KeyError, ValueError) as exc:
+            st.error(f"Document indexing failed: {exc}")
 
 
 # ---------------------------------------------------------------------------
@@ -353,12 +421,12 @@ if submit and query.strip():
 # ---------------------------------------------------------------------------
 # Query history
 # ---------------------------------------------------------------------------
-if st.session_state.history:
-    st.markdown("---")
-    with st.expander(f"🕑 Query history ({len(st.session_state.history)} queries)", expanded=False):
-        for i, h in enumerate(st.session_state.history):
-            st.markdown(
-                f"**{i+1}. {h['query']}** — "
-                f"faithfulness: `{h['result'].get('faithfulness_score', 0):.0%}` | "
-                f"latency: `{h['elapsed']:.2f}s`"
-            )
+# if st.session_state.history:
+#     st.markdown("---")
+#     with st.expander(f"🕑 Query history ({len(st.session_state.history)} queries)", expanded=False):
+#         for i, h in enumerate(st.session_state.history):
+#             st.markdown(
+#                 f"**{i+1}. {h['query']}** — "
+#                 f"faithfulness: `{h['result'].get('faithfulness_score', 0):.0%}` | "
+#                 f"latency: `{h['elapsed']:.2f}s`"
+#             )
