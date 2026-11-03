@@ -168,6 +168,15 @@ class ProductionHybridRAG:
         tokenized = [c.text.lower().split() for c in chunks]
         self.bm25 = BM25Okapi(tokenized)
 
+    def append_documents(self, chunks: List[DocumentChunk]) -> None:
+        """Add uploaded chunks while retaining documents already indexed."""
+        if not chunks:
+            return
+        existing_ids = {chunk.chunk_id for chunk in self.corpus_chunks}
+        new_chunks = [chunk for chunk in chunks if chunk.chunk_id not in existing_ids]
+        if new_chunks:
+            self.index_documents(self.corpus_chunks + new_chunks)
+
     # ------------------------------------------------------------------
     #   Retrieval
     # ------------------------------------------------------------------
@@ -176,53 +185,67 @@ class ProductionHybridRAG:
         query: str,
         top_candidates: int = 20,
         final_k: int = 5,
+        mode: str = "hybrid_rerank",
     ) -> List[DocumentChunk]:
-        """Return final_k candidate chunks after RRF fusion and cross-encoder rerank."""
-        query_vec = self.dense_model.encode(query).tolist()
+        """Retrieve chunks using one of the documented ablation configurations.
+
+        ``dense`` (C1), ``bm25`` (C2), ``hybrid`` (C3), and
+        ``hybrid_rerank`` (C4) are supported. The default retains the original
+        hybrid-plus-reranker behavior.
+        """
+        if mode not in {"dense", "bm25", "hybrid", "hybrid_rerank"}:
+            raise ValueError(
+                f"Unknown retrieval mode {mode!r}; expected dense, bm25, hybrid, or hybrid_rerank"
+            )
+        if top_candidates <= 0 or final_k <= 0:
+            return []
+
         dense_cids: List[str] = []
         dense_chunk_map: Dict[str, DocumentChunk] = {}
 
         # ---- Dense retrieval ----
-        if self.vector_db == "pinecone":
-            query_res = self.pinecone_index.query(
-                vector=query_vec,
-                top_k=top_candidates,
-                include_metadata=True,
-            )
-            matches = getattr(query_res, "matches", None)
-            if matches is None and isinstance(query_res, dict):
-                matches = query_res.get("matches", [])
+        if mode in {"dense", "hybrid", "hybrid_rerank"}:
+            query_vec = self.dense_model.encode(query).tolist()
+            if self.vector_db == "pinecone":
+                query_res = self.pinecone_index.query(
+                    vector=query_vec,
+                    top_k=top_candidates,
+                    include_metadata=True,
+                )
+                matches = getattr(query_res, "matches", None)
+                if matches is None and isinstance(query_res, dict):
+                    matches = query_res.get("matches", [])
 
-            for match in matches or []:
-                meta = (
-                    getattr(match, "metadata", None)
-                    or (match.get("metadata") if isinstance(match, dict) else {})
-                    or {}
-                )
-                match_id = getattr(match, "id", None) or (
-                    match.get("id") if isinstance(match, dict) else ""
-                )
-                cid = str(meta.get("chunk_id") or match_id)
-                if cid:
-                    dense_cids.append(cid)
-                    if cid not in dense_chunk_map and "text" in meta:
-                        dense_chunk_map[cid] = DocumentChunk(
-                            chunk_id=cid,
-                            doc_id=meta.get("doc_id", "doc"),
-                            text=meta.get("text", ""),
-                            parent_text=meta.get("parent_text", meta.get("text", "")),
-                        )
-        else:
-            dense_hits = self.qdrant.query_points(
-                collection_name=self.collection_name,
-                query=query_vec,
-                limit=top_candidates,
-            ).points
-            dense_cids = [str(hit.payload["chunk_id"]) for hit in dense_hits]
+                for match in matches or []:
+                    meta = (
+                        getattr(match, "metadata", None)
+                        or (match.get("metadata") if isinstance(match, dict) else {})
+                        or {}
+                    )
+                    match_id = getattr(match, "id", None) or (
+                        match.get("id") if isinstance(match, dict) else ""
+                    )
+                    cid = str(meta.get("chunk_id") or match_id)
+                    if cid:
+                        dense_cids.append(cid)
+                        if cid not in dense_chunk_map and "text" in meta:
+                            dense_chunk_map[cid] = DocumentChunk(
+                                chunk_id=cid,
+                                doc_id=meta.get("doc_id", "doc"),
+                                text=meta.get("text", ""),
+                                parent_text=meta.get("parent_text", meta.get("text", "")),
+                            )
+            else:
+                dense_hits = self.qdrant.query_points(
+                    collection_name=self.collection_name,
+                    query=query_vec,
+                    limit=top_candidates,
+                ).points
+                dense_cids = [str(hit.payload["chunk_id"]) for hit in dense_hits]
 
         # ---- Sparse BM25 retrieval ----
         sparse_cids: List[str] = []
-        if self.bm25 is not None and self.corpus_chunks:
+        if mode in {"bm25", "hybrid", "hybrid_rerank"} and self.bm25 is not None and self.corpus_chunks:
             tokenized_q = query.lower().split()
             bm25_scores = self.bm25.get_scores(tokenized_q)  # type: ignore[arg-type]
             sparse_idx = sorted(
@@ -230,20 +253,20 @@ class ProductionHybridRAG:
             )[:top_candidates]
             sparse_cids = [self.corpus_chunks[idx].chunk_id for idx in sparse_idx]
 
-        # ---- Reciprocal Rank Fusion (RRF) ----
-        k_smooth = 60
-        rrf: Dict[str, float] = {}
+        # ---- Select a ranked candidate pool ----
+        if mode == "dense":
+            fused_ids = dense_cids[:top_candidates]
+        elif mode == "bm25":
+            fused_ids = sparse_cids[:top_candidates]
+        else:
+            k_smooth = 60
+            rrf: Dict[str, float] = {}
+            for rank, cid in enumerate(dense_cids, start=1):
+                rrf[cid] = rrf.get(cid, 0.0) + 1.0 / (k_smooth + rank)
+            for rank, cid in enumerate(sparse_cids, start=1):
+                rrf[cid] = rrf.get(cid, 0.0) + 1.0 / (k_smooth + rank)
+            fused_ids = sorted(rrf, key=rrf.get, reverse=True)[:top_candidates]
 
-        # Dense contribution
-        for rank, cid in enumerate(dense_cids, start=1):
-            rrf[cid] = rrf.get(cid, 0.0) + 1.0 / (k_smooth + rank)
-
-        # Sparse contribution
-        for rank, cid in enumerate(sparse_cids, start=1):
-            rrf[cid] = rrf.get(cid, 0.0) + 1.0 / (k_smooth + rank)
-
-        # Keep top candidates for reranking
-        fused_ids = sorted(rrf, key=rrf.get, reverse=True)[:top_candidates]
         id_to_chunk = {c.chunk_id: c for c in self.corpus_chunks}
         # Fall back to metadata received from Pinecone if not in local corpus_chunks
         id_to_chunk.update(dense_chunk_map)
@@ -251,6 +274,10 @@ class ProductionHybridRAG:
         candidates = [id_to_chunk[cid] for cid in fused_ids if cid in id_to_chunk]
         if not candidates:
             return []
+
+        candidates = candidates[:top_candidates]
+        if mode != "hybrid_rerank":
+            return candidates[:final_k]
 
         # ---- Cross-Encoder reranking ----
         pairs = [[query, c.text] for c in candidates]
@@ -260,6 +287,21 @@ class ProductionHybridRAG:
         )[:final_k]
 
         return [candidates[i] for i in rerank_idx]
+
+    def retrieve(
+        self,
+        query: str,
+        mode: str = "hybrid_rerank",
+        k: int = 5,
+        top_candidates: int = 20,
+    ) -> List[DocumentChunk]:
+        """Stable public entry point used by the evaluation harness."""
+        return self.hybrid_retrieve(
+            query,
+            top_candidates=top_candidates,
+            final_k=k,
+            mode=mode,
+        )
 
 
 """End of ProductionHybridRAG implementation."""
