@@ -10,12 +10,14 @@ POST /query
 """
 
 import re
+from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, File, HTTPException, UploadFile
 from pydantic import BaseModel
 
 from rag_hybrid.src.eval.faithfulness import FaithfulnessEvaluator
 from rag_hybrid.src.generator.generator import generate_answer
+from rag_hybrid.src.ingestion import chunk_document, read_document_bytes
 
 # Local imports – the repository root is added to ``PYTHONPATH`` when the
 # package is installed in editable mode (``pip install -e .``).  Therefore we
@@ -41,6 +43,12 @@ class QueryResponse(BaseModel):
     faithfulness_score: float
     violations: list[str] | None = None
 
+
+class UploadResponse(BaseModel):
+    files: list[str]
+    chunks_indexed: int
+    total_chunks: int
+
 # ---------------------------------------------------------------------
 #   Helper utilities
 # ---------------------------------------------------------------------
@@ -54,8 +62,10 @@ def _extract_claims(answer: str) -> list[dict[str, str]]:
     and matches the contract described in the project specification.
     """
     match = _CITATION_RE.search(answer)
-    citation = f"Chunk_{match.group('cid')}" if match else ""
-    claim = answer.replace(match.group(0), "").strip() if match else answer.strip()
+    if not match:
+        return []
+    citation = f"Chunk_{match.group('cid')}"
+    claim = answer.replace(match.group(0), "").strip()
     return [{"claim": claim, "citation": citation}]
 
 # ---------------------------------------------------------------------
@@ -64,6 +74,32 @@ def _extract_claims(answer: str) -> list[dict[str, str]]:
 @app.get("/health")
 async def health_check():
     return {"status": "ok"}
+
+
+@app.post("/documents", response_model=UploadResponse)
+async def upload_documents(files: list[UploadFile] = File(...)):
+    """Parse, chunk, embed, and index uploaded documents."""
+    indexed_files: list[str] = []
+    chunks = []
+    for file in files:
+        filename = Path(file.filename or "").name
+        try:
+            text = read_document_bytes(filename, await file.read())
+            document_chunks = chunk_document(filename, text)
+        except (ValueError, RuntimeError, ImportError) as exc:
+            raise HTTPException(status_code=400, detail=f"{filename}: {exc}") from exc
+        if not document_chunks:
+            raise HTTPException(status_code=400, detail=f"{filename}: document is empty")
+        indexed_files.append(filename)
+        chunks.extend(document_chunks)
+
+    _rag.append_documents(chunks)
+    return UploadResponse(
+        files=indexed_files,
+        chunks_indexed=len(chunks),
+        total_chunks=len(_rag.corpus_chunks),
+    )
+
 
 @app.post("/query", response_model=QueryResponse)
 async def query_endpoint(req: QueryRequest):
