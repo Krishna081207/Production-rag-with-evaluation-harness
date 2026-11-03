@@ -3,6 +3,7 @@ import glob
 import os
 from typing import List
 
+from rag_hybrid.src.ingestion import chunk_document, read_document_bytes
 from rag_hybrid.src.retriever.hybrid import DocumentChunk, ProductionHybridRAG
 
 
@@ -13,41 +14,11 @@ def load_raw_documents(data_dir: str) -> List[tuple[str, str]]:
     docs = []
     for path in glob.glob(os.path.join(data_dir, "**/*"), recursive=True):
         if os.path.isfile(path) and path.lower().endswith((".txt", ".md", ".pdf")):
-            with open(path, "r", encoding="utf-8", errors="ignore") as f:
-                txt = f.read()
+            with open(path, "rb") as file:
+                txt = read_document_bytes(path, file.read())
             doc_id = os.path.relpath(path, data_dir).replace(os.sep, "_")
             docs.append((doc_id, txt))
     return docs
-
-
-def chunk_document(doc_id: str, text: str, child_len: int = 300) -> List[DocumentChunk]:
-    """Create hierarchical parent/child chunks.
-
-    * child_len – number of words per child chunk (default 300).
-    * parent chunk – concatenates up to 4 consecutive child chunks (~1200 words).
-    """
-    words = text.split()
-    child_chunks = []
-    for i in range(0, len(words), child_len):
-        child_text = " ".join(words[i : i + child_len])
-        child_id = f"{doc_id}_c{i // child_len}"
-        child_chunks.append((child_id, child_text))
-
-    # Build parent chunks (group of up to 4 child chunks)
-    parent_chunks: List[DocumentChunk] = []
-    for i in range(0, len(child_chunks), 4):
-        group = child_chunks[i : i + 4]
-        parent_text = " ".join(c[1] for c in group)
-        for child_id, child_text in group:
-            parent_chunks.append(
-                DocumentChunk(
-                    chunk_id=child_id,
-                    doc_id=doc_id,
-                    text=child_text,
-                    parent_text=parent_text,
-                )
-            )
-    return parent_chunks
 
 
 def main():
