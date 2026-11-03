@@ -7,6 +7,7 @@ falls back to running the pipeline inline so the UI always works in demo mode.
 
 import os
 import time
+from typing import Any
 
 import requests
 import streamlit as st
@@ -253,16 +254,9 @@ def _load_inline_pipeline(vector_db: str = "pinecone"):
     """Load the RAG components once and cache them."""
     import re
 
-    try:
-        from rag_hybrid.src.eval.faithfulness import FaithfulnessEvaluator
-        from rag_hybrid.src.generator.generator import generate_answer
-        from rag_hybrid.src.retriever.hybrid import DocumentChunk, ProductionHybridRAG
-    except ModuleNotFoundError as exc:
-        if exc.name != "rag_hybrid":
-            raise
-        from src.eval.faithfulness import FaithfulnessEvaluator
-        from src.generator.generator import generate_answer
-        from src.retriever.hybrid import DocumentChunk, ProductionHybridRAG
+    from src.eval.faithfulness import FaithfulnessEvaluator
+    from src.generator.generator import generate_answer
+    from src.retriever.hybrid import DocumentChunk, ProductionHybridRAG
 
     rag = ProductionHybridRAG(vector_db=vector_db)
     evaluator = FaithfulnessEvaluator()
@@ -312,9 +306,9 @@ def call_inline(q: str, vector_db: str = "pinecone") -> dict:
     }
 
 
-def index_inline_documents(files: list) -> dict:
+def index_inline_documents(files: list) -> dict[str, Any]:
     """Parse and index selected documents in the cached inline pipeline."""
-    from rag_hybrid.src.ingestion import chunk_document, read_document_bytes
+    from src.ingestion import chunk_document, read_document_bytes
 
     rag, _, _, _ = _load_inline_pipeline(vdb_choice)
     all_chunks = []
@@ -333,7 +327,7 @@ def index_inline_documents(files: list) -> dict:
     }
 
 
-if index_uploads:
+if index_uploads and stfile:
     with st.spinner("Parsing, chunking, embedding, and indexing…"):
         try:
             upload_result = (
@@ -374,6 +368,7 @@ if submit and query.strip():
         if mode == "API (FastAPI)":
             st.info("💡 Make sure the API server is running: `uvicorn rag_hybrid.src.api.app:app --reload`")
     else:
+        assert result is not None
         # Save to history
         st.session_state.history.insert(
             0,
