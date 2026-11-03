@@ -27,6 +27,20 @@ class GenerationResult(BaseModel):
     answer: str
     citations: List[str]
 
+
+def _extractive_fallback(retrieved_chunks: List[DocumentChunk]) -> GenerationResult:
+    """Return grounded context when the external generator is unavailable."""
+    chunk = retrieved_chunks[0]
+    text = " ".join(chunk.parent_text.split())
+    sentence = text.split(". ", 1)[0].strip()
+    if not sentence:
+        sentence = text
+    if sentence and not sentence.endswith((".", "!", "?")):
+        sentence += "."
+    citation = f"Chunk_{chunk.chunk_id}"
+    return GenerationResult(answer=f"{sentence} [{citation}]", citations=[citation])
+
+
 def _build_prompt(query: str, chunks: List[DocumentChunk]) -> str:
     """Create a prompt that enforces the citation contract.
 
@@ -72,8 +86,8 @@ def generate_answer(query: str, retrieved_chunks: List[DocumentChunk]) -> Genera
         )
         answer_text = response.choices[0].message.content.strip()
     except Exception as e:
-        answer_text = "The provided documentation does not contain sufficient evidence to answer this inquiry."
         print(f"Groq API error: {e}")
+        return _extractive_fallback(retrieved_chunks)
 
     # Extract citations (Chunk_<ID>) from the answer
     import re
