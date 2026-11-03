@@ -253,9 +253,16 @@ def _load_inline_pipeline(vector_db: str = "pinecone"):
     """Load the RAG components once and cache them."""
     import re
 
-    from rag_hybrid.src.eval.faithfulness import FaithfulnessEvaluator
-    from rag_hybrid.src.generator.generator import generate_answer
-    from rag_hybrid.src.retriever.hybrid import DocumentChunk, ProductionHybridRAG
+    try:
+        from rag_hybrid.src.eval.faithfulness import FaithfulnessEvaluator
+        from rag_hybrid.src.generator.generator import generate_answer
+        from rag_hybrid.src.retriever.hybrid import DocumentChunk, ProductionHybridRAG
+    except ModuleNotFoundError as exc:
+        if exc.name != "rag_hybrid":
+            raise
+        from src.eval.faithfulness import FaithfulnessEvaluator
+        from src.generator.generator import generate_answer
+        from src.retriever.hybrid import DocumentChunk, ProductionHybridRAG
 
     rag = ProductionHybridRAG(vector_db=vector_db)
     evaluator = FaithfulnessEvaluator()
