@@ -49,7 +49,8 @@ VECTOR_DB=pinecone                       # 'pinecone' or 'qdrant'
 PINECONE_INDEX_NAME=rag-hybrid
 GROQ_API_KEY=your_groq_api_key
 
-# 3. Index your documents (drop .txt / .md / .pdf files into data/)
+# 3. Index documents from the CLI (optional)
+# The Streamlit UI also indexes uploaded .txt / .md / .pdf / .docx files.
 # For Pinecone:
 python scripts/ingest.py --vector-db pinecone --source data/
 
@@ -61,6 +62,23 @@ uvicorn rag_hybrid.src.api.app:app --reload
 
 # 4b. Run the Streamlit UI (in a second terminal)
 streamlit run scripts/app_streamlit.py
+```
+
+### Upload and query flow
+
+In the Streamlit UI, choose one or more documents and click **Index uploaded
+documents**. The API then parses each file, creates hierarchical child/parent
+chunks, generates dense embeddings, stores them in the configured vector
+database, and rebuilds the BM25 index. A subsequent question retrieves a
+candidate pool with dense and sparse search, fuses the rankings, reranks the
+pool with the cross-encoder, generates a cited answer, and evaluates its
+faithfulness against the retrieved parent context.
+
+The upload API is also available directly:
+
+```bash
+curl -X POST http://localhost:8000/documents \
+  -F "files=@data/example.pdf"
 ```
 
 ### Docker Compose (all services)
@@ -103,6 +121,20 @@ Run the harness manually:
 ```bash
 python scripts/evaluate_harness.py
 ```
+
+For the Sprint 1 retrieval ablation, prepare a chunk JSONL file with one
+`DocumentChunk` object per line and a gold JSONL file whose rows include
+`question` and `gold_chunks`. Then run all four configurations:
+
+```bash
+python eval/run_eval.py --chunks data/chunks.jsonl --gold gold/gold.jsonl
+```
+
+The table reports Recall@5, hit rate@5, MRR, nDCG@5, and p50/p95 retrieval
+latency for C1 dense-only, C2 BM25-only, C3 hybrid RRF, and C4 hybrid RRF
+with cross-encoder reranking. The same retriever is also available through
+`retrieve(query, mode=..., k=...)`; supported modes are `dense`, `bm25`,
+`hybrid`, and `hybrid_rerank`.
 
 ---
 
