@@ -28,6 +28,8 @@ dependencies = [
     "streamlit",
     "python-dotenv",
     "requests",
+    "PyMuPDF",
+    "python-docx",
 ]
 
 [project.urls]
