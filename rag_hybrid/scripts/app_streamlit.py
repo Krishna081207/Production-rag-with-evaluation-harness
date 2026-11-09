@@ -1,8 +1,7 @@
 """Streamlit front-end for research paper understanding.
 
-Calls the FastAPI backend at http://localhost:8000 (or the URL defined by
-``RAG_API_URL`` environment variable).  When the API is not reachable, it
-falls back to running the pipeline inline so the UI always works in demo mode.
+API mode calls the FastAPI backend at ``RAG_API_URL``. Inline mode runs a
+temporary, in-memory demo pipeline in this process.
 """
 
 import os
@@ -14,6 +13,7 @@ import streamlit as st
 from dotenv import load_dotenv
 
 load_dotenv()
+API_START_COMMAND = "python -m uvicorn rag_hybrid.src.api.app:app --reload"
 
 # ---------------------------------------------------------------------------
 # Page config
@@ -359,7 +359,12 @@ if index_uploads and stfile:
                 f"Total indexed chunks: {upload_result['total_chunks']}."
             )
         except requests.RequestException as exc:
-            st.error(f"Document indexing failed: {exc}")
+            if isinstance(exc, requests.ConnectionError):
+                st.error(f"Cannot connect to FastAPI at {api_url.rstrip('/')}.")
+                st.info("Start the API in another terminal and leave it running while you use the UI:")
+                st.code(API_START_COMMAND, language="powershell")
+            else:
+                st.error(f"Document indexing failed: {exc}")
         except (KeyError, ValueError) as exc:
             st.error(f"Document indexing failed: {exc}")
         except Exception as exc:
@@ -373,20 +378,25 @@ if submit and query.strip():
     with st.spinner("Retrieving and generating…"):
         t0 = time.perf_counter()
         error = None
+        api_unavailable = False
         result = None
         try:
             if mode == "API (FastAPI)":
                 result = call_api(query.strip())
             else:
                 result = call_inline(query.strip())
+        except requests.ConnectionError:
+            error = f"Cannot connect to FastAPI at {api_url.rstrip('/')}"
+            api_unavailable = True
         except Exception as exc:
             error = str(exc)
         elapsed = time.perf_counter() - t0
 
     if error:
         st.error(f"❌ Error: {error}")
-        if mode == "API (FastAPI)":
-            st.info("💡 Make sure the API server is running: `uvicorn rag_hybrid.src.api.app:app --reload`")
+        if api_unavailable:
+            st.info("Start the API in another terminal and leave it running while you use the UI:")
+            st.code(API_START_COMMAND, language="powershell")
     else:
         assert result is not None
         # Save to history

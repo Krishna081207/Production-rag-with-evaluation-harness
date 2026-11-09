@@ -40,7 +40,7 @@ Edit `.env` and set a long random `ADMIN_API_KEY` to enable uploads. Set `GROQ_A
 Start the API and UI in separate terminals:
 
 ```powershell
-uvicorn rag_hybrid.src.api.app:app --reload
+python -m uvicorn rag_hybrid.src.api.app:app --reload
 ```
 
 ```powershell
