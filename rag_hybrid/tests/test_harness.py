@@ -1,15 +1,15 @@
 # tests/test_harness.py
-"""Unit tests for the evaluation harness metrics (hallucination rate & MMR)."""
+"""Unit tests for citation-format and retrieval-diversity metrics."""
 
 import pytest
 
-from rag_hybrid.src.retriever.hybrid import DocumentChunk
-from scripts.evaluate_harness import (
+from rag_hybrid.scripts.evaluate_harness import (
     _jaccard,
     _split_sentences,
     hallucination_rate,
     mmr_score,
 )
+from rag_hybrid.src.retriever.hybrid import DocumentChunk
 
 # ---------------------------------------------------------------------------
 # _split_sentences

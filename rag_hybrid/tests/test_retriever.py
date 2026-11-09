@@ -141,7 +141,7 @@ class TestPineconeRetriever:
     def test_missing_api_key_raises_error(self, monkeypatch):
         monkeypatch.delenv("PINECONE_API_KEY", raising=False)
         monkeypatch.delenv("db_key", raising=False)
-        with pytest.raises(ValueError, match="Pinecone API key not found"):
+        with pytest.raises(ValueError, match="PINECONE_API_KEY is required"):
             ProductionHybridRAG(vector_db="pinecone", pinecone_api_key=None)
 
     def test_pinecone_index_and_retrieve(self, monkeypatch, three_chunks):

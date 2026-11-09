@@ -1,4 +1,4 @@
-"""Streamlit front-end for the rag_hybrid RAG pipeline.
+"""Streamlit front-end for research paper understanding.
 
 Calls the FastAPI backend at http://localhost:8000 (or the URL defined by
 ``RAG_API_URL`` environment variable).  When the API is not reachable, it
@@ -19,8 +19,8 @@ load_dotenv()
 # Page config
 # ---------------------------------------------------------------------------
 st.set_page_config(
-    page_title="🔍 Production RAG – Hybrid Search",
-    page_icon="🔍",
+    page_title="Research Paper Assistant",
+    page_icon="📄",
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -31,10 +31,8 @@ st.set_page_config(
 st.markdown(
     """
     <style>
-    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700&display=swap');
-
     html, body, [class*="css"] {
-        font-family: 'Inter', sans-serif;
+        font-family: Inter, system-ui, sans-serif;
     }
 
     /* Dark gradient background */
@@ -129,9 +127,9 @@ st.markdown(
 # Sidebar – configuration
 # ---------------------------------------------------------------------------
 #upload documents
-st.markdown("## 📂 Upload Documents")
+st.markdown("## 📄 Upload research sources")
 stfile = st.file_uploader(
-    "Upload documents",
+    "Upload papers or supporting documents",
     type=["pdf", "txt", "md", "docx"],
     accept_multiple_files=True,
 )
@@ -141,10 +139,6 @@ index_uploads = st.button(
     help="Parse, chunk, embed, and store the selected documents for search.",
 )
 with st.sidebar:
-    st.image(
-        "https://raw.githubusercontent.com/simple-icons/simple-icons/develop/icons/openai.svg",
-        width=40,
-    )
     st.markdown("## ⚙️ Settings")
 
     api_url = st.text_input(
@@ -162,19 +156,12 @@ with st.sidebar:
         "Backend",
         ["API (FastAPI)", "Inline (no server)"],
         index=0,
-        help="Inline mode runs the pipeline directly in this process — useful when the API server is not running.",
-    )
-
-    vdb_choice = st.selectbox(
-        "Vector Database (Inline mode)",
-        ["pinecone", "qdrant"],
-        index=0 if os.getenv("VECTOR_DB", "pinecone").lower() == "pinecone" else 1,
-        help="Select Pinecone for cloud vector index or Qdrant for local in-memory search.",
+        help="Inline mode uses an in-memory demo corpus; uploaded papers are temporary. Use API mode for persistent storage.",
     )
 
     st.divider()
     st.markdown(
-        "<small style='color:#94a3b8;'>Production RAG · Hybrid Dense+BM25+RRF · "
+        "<small style='color:#94a3b8;'>Research Paper Assistant · Hybrid Dense+BM25+RRF · "
         "Cross-Encoder reranker · NLI faithfulness</small>",
         unsafe_allow_html=True,
     )
@@ -187,11 +174,11 @@ st.markdown(
     <div class="hero-card">
         <h1 style="margin:0;font-size:2rem;background:linear-gradient(90deg,#a5b4fc,#c4b5fd);
             -webkit-background-clip:text;-webkit-text-fill-color:transparent;">
-            🔍 Production RAG · Hybrid Search
+            📄 Research Paper Assistant
         </h1>
         <p style="color:#94a3b8;margin-top:0.5rem;">
-            Dense (BGE) + BM25 → RRF fusion → Cross-Encoder reranking → Groq LLM
-            → NLI faithfulness evaluation
+            Ask about a paper’s research question, contributions, methods, results, and limitations.
+            Answers link back to retrieved source chunks and PDF pages.
         </p>
     </div>
     """,
@@ -211,7 +198,7 @@ col_input, col_btn = st.columns([5, 1])
 with col_input:
     query = st.text_input(
         "Your question",
-        placeholder="e.g. What is Python used for?",
+        placeholder="e.g. What are the paper’s key findings?",
         label_visibility="collapsed",
     )
 with col_btn:
@@ -226,7 +213,7 @@ def call_api(q: str) -> dict:
     resp = requests.post(
         f"{api_url.rstrip('/')}/query",
         json={"query": q},
-        timeout=60,
+        timeout=180,
     )
     resp.raise_for_status()
     return resp.json()
@@ -241,7 +228,8 @@ def upload_documents(files: list) -> dict:
     resp = requests.post(
         f"{api_url.rstrip('/')}/documents",
         files=payload,
-        timeout=120,
+        headers={"X-Admin-Key": os.getenv("ADMIN_API_KEY", "")},
+        timeout=180,
     )
     resp.raise_for_status()
     return resp.json()
@@ -250,57 +238,86 @@ def upload_documents(files: list) -> dict:
 # Helper: inline pipeline (no server required)
 # ---------------------------------------------------------------------------
 @st.cache_resource(show_spinner="Loading models…")
-def _load_inline_pipeline(vector_db: str = "pinecone"):
+def _load_inline_pipeline():
     """Load the RAG components once and cache them."""
     import re
 
-    from src.eval.faithfulness import FaithfulnessEvaluator
-    from src.generator.generator import generate_answer
-    from src.retriever.hybrid import DocumentChunk, ProductionHybridRAG
+    from rag_hybrid.src.eval.faithfulness import FaithfulnessEvaluator
+    from rag_hybrid.src.generator.generator import generate_answer
+    from rag_hybrid.src.retriever.hybrid import DocumentChunk, ProductionHybridRAG
 
-    rag = ProductionHybridRAG(vector_db=vector_db)
+    rag = ProductionHybridRAG(vector_db="qdrant", qdrant_path=":memory:")
     evaluator = FaithfulnessEvaluator()
 
     # Seed a tiny demo corpus so the UI works out of the box
     demo_chunks = [
         DocumentChunk(
-            chunk_id="demo_c1",
-            doc_id="demo",
-            text="Python is a high-level, dynamically typed programming language popular in data science and web development.",
-            parent_text="Python is a high-level, dynamically typed programming language popular in data science and web development.",
+            chunk_id="demo_retrieval_p1_c0",
+            doc_id="demo_retrieval",
+            source_name="synthetic_demo_paper.pdf",
+            page_number=1,
+            text="Research question: Does combining dense semantic retrieval and BM25 improve evidence retrieval for a research assistant?",
+            parent_text="Research question: Does combining dense semantic retrieval and BM25 improve evidence retrieval for a research assistant? The synthetic demonstration compares each method on a small illustrative corpus.",
         ),
         DocumentChunk(
-            chunk_id="demo_c2",
-            doc_id="demo",
-            text="FastAPI is a modern, fast web framework for building APIs with Python based on type hints.",
-            parent_text="FastAPI is a modern, fast web framework for building APIs with Python based on type hints.",
+            chunk_id="demo_retrieval_p2_c0",
+            doc_id="demo_retrieval",
+            source_name="synthetic_demo_paper.pdf",
+            page_number=2,
+            text="Method: The synthetic study compares BM25, dense retrieval, and reciprocal rank fusion using Recall@5 on manually labeled questions.",
+            parent_text="Method: The synthetic study compares BM25, dense retrieval, and reciprocal rank fusion using Recall@5 on manually labeled questions. This example contains no real experimental results.",
         ),
         DocumentChunk(
-            chunk_id="demo_c3",
-            doc_id="demo",
-            text="Pinecone and Qdrant are vector databases designed for high-performance similarity search.",
-            parent_text="Pinecone and Qdrant are vector databases designed for high-performance similarity search.",
+            chunk_id="demo_retrieval_p3_c0",
+            doc_id="demo_retrieval",
+            source_name="synthetic_demo_paper.pdf",
+            page_number=3,
+            text="Limitation: Results from a small synthetic example cannot establish how retrieval methods perform across scientific fields or full-length papers.",
+            parent_text="Limitation: Results from a small synthetic example cannot establish how retrieval methods perform across scientific fields or full-length papers.",
         ),
     ]
     rag.index_documents(demo_chunks)
     return rag, evaluator, generate_answer, re
 
 
-def call_inline(q: str, vector_db: str = "pinecone") -> dict:
-    rag, evaluator, generate_answer, _re = _load_inline_pipeline(vector_db)
+def call_inline(q: str) -> dict:
+    rag, evaluator, generate_answer, _re = _load_inline_pipeline()
     retrieved = rag.hybrid_retrieve(q, top_candidates=10, final_k=top_k)
     gen_res = generate_answer(q, retrieved)
-    retrieved_map = {c.chunk_id: c.parent_text for c in retrieved}
-    match = _re.search(r"\[Chunk_(?P<cid>[^\]]+)\]", gen_res.answer)
+    retrieved_map = {
+        key: c.parent_text
+        for c in retrieved
+        for key in (c.chunk_id, f"Chunk_{c.chunk_id}")
+    }
     claims = []
-    if match:
-        citation = f"Chunk_{match.group('cid')}"
-        claim = gen_res.answer.replace(match.group(0), "").strip()
-        claims.append({"claim": claim, "citation": citation})
+    abstention = "The provided documentation does not contain sufficient evidence to answer this inquiry."
+    if gen_res.answer != abstention:
+        for sentence in _re.split(r"(?<=[.!?])\s+", gen_res.answer.strip()):
+            sentence = sentence.strip()
+            if not sentence:
+                continue
+            cited_ids = _re.findall(r"\[Chunk_([^\]]+)\]", sentence)
+            claim = _re.sub(r"\[Chunk_[^\]]+\]", "", sentence).strip()
+            claims.extend(
+                {"claim": claim, "citation": f"Chunk_{chunk_id}"}
+                for chunk_id in cited_ids
+            )
+            if not cited_ids and claim:
+                claims.append({"claim": claim, "citation": ""})
     eval_res = evaluator.evaluate_generation(claims, retrieved_map)
+    chunks_by_citation = {f"Chunk_{chunk.chunk_id}": chunk for chunk in retrieved}
     return {
         "answer": gen_res.answer,
         "citations": gen_res.citations,
+        "citation_details": [
+            {
+                "citation": citation,
+                "source_name": chunks_by_citation[citation].source_name or chunks_by_citation[citation].doc_id,
+                "page_number": chunks_by_citation[citation].page_number,
+            }
+            for citation in gen_res.citations
+            if citation in chunks_by_citation
+        ],
         "faithfulness_score": eval_res.faithfulness_score,
         "violations": eval_res.violations or None,
     }
@@ -308,21 +325,22 @@ def call_inline(q: str, vector_db: str = "pinecone") -> dict:
 
 def index_inline_documents(files: list) -> dict[str, Any]:
     """Parse and index selected documents in the cached inline pipeline."""
-    from src.ingestion import chunk_document, read_document_bytes
+    from rag_hybrid.src.ingestion import chunk_document_segments, read_document_segments
 
-    rag, _, _, _ = _load_inline_pipeline(vdb_choice)
+    rag, _, _, _ = _load_inline_pipeline()
     all_chunks = []
     indexed_files = []
     for file in files:
-        chunks = chunk_document(file.name, read_document_bytes(file.name, file.getvalue()))
+        _, segments = read_document_segments(file.name, file.getvalue())
+        chunks = chunk_document_segments(file.name, segments)
         if not chunks:
             raise ValueError(f"{file.name}: document is empty")
         indexed_files.append(file.name)
         all_chunks.extend(chunks)
-    rag.append_documents(all_chunks)
+    added = rag.replace_sources(all_chunks)
     return {
         "files": indexed_files,
-        "chunks_indexed": len(all_chunks),
+        "chunks_indexed": len(added),
         "total_chunks": len(rag.corpus_chunks),
     }
 
@@ -344,6 +362,8 @@ if index_uploads and stfile:
             st.error(f"Document indexing failed: {exc}")
         except (KeyError, ValueError) as exc:
             st.error(f"Document indexing failed: {exc}")
+        except Exception as exc:
+            st.error(f"Document indexing failed: {exc}")
 
 
 # ---------------------------------------------------------------------------
@@ -358,7 +378,7 @@ if submit and query.strip():
             if mode == "API (FastAPI)":
                 result = call_api(query.strip())
             else:
-                result = call_inline(query.strip(), vector_db=vdb_choice)
+                result = call_inline(query.strip())
         except Exception as exc:
             error = str(exc)
         elapsed = time.perf_counter() - t0
@@ -379,19 +399,23 @@ if submit and query.strip():
         st.markdown("---")
 
         # Answer
-        st.markdown(
-            f'<div class="answer-box">{result["answer"]}</div>',
-            unsafe_allow_html=True,
-        )
+        with st.container(border=True):
+            st.markdown(result["answer"])
 
         # Metrics row
         c1, c2, c3 = st.columns(3)
-        faith = result.get("faithfulness_score", 0.0)
-        faith_color = "#22c55e" if faith >= 0.8 else "#f59e0b" if faith >= 0.5 else "#ef4444"
+        faith = result.get("faithfulness_score")
+        faith_color = (
+            "#22c55e" if faith is not None and faith >= 0.8
+            else "#f59e0b" if faith is not None and faith >= 0.5
+            else "#94a3b8" if faith is None
+            else "#ef4444"
+        )
+        faith_text = f"{faith:.0%}" if faith is not None else "N/A"
         with c1:
             st.markdown(
                 f'<div class="metric-card"><div style="font-size:1.8rem;font-weight:700;color:{faith_color};">'
-                f'{faith:.0%}</div><div style="color:#94a3b8;font-size:0.85rem;">Faithfulness</div></div>',
+                f'{faith_text}</div><div style="color:#94a3b8;font-size:0.85rem;">Evidence support</div></div>',
                 unsafe_allow_html=True,
             )
         with c2:
@@ -410,15 +434,24 @@ if submit and query.strip():
 
         # Citations
         if result.get("citations"):
-            st.markdown("**📎 Citations**")
-            chips = "".join(f'<span class="chip">{c}</span>' for c in result["citations"])
-            st.markdown(chips, unsafe_allow_html=True)
+            st.markdown("**📎 Sources**")
+            details = result.get("citation_details") or []
+            if details:
+                labels = []
+                for item in details:
+                    label = item["source_name"]
+                    if item.get("page_number") is not None:
+                        label += f", p. {item['page_number']}"
+                    labels.append(f"{label} ({item['citation']})")
+                st.caption(" · ".join(labels))
+            else:
+                st.caption(" · ".join(str(c) for c in result["citations"]))
 
         # Violations
         if show_violations and result.get("violations"):
             st.markdown("**⚠️ Citation violations**")
             for v in result["violations"]:
-                st.markdown(f'<div class="violation">⚠️ {v}</div>', unsafe_allow_html=True)
+                st.warning(v)
 
 # ---------------------------------------------------------------------------
 # Query history

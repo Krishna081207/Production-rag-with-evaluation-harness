@@ -49,13 +49,33 @@ class TestHealthEndpoint:
 
 class TestDocumentUpload:
     @patch("rag_hybrid.src.api.app._rag")
-    def test_upload_indexes_documents(self, mock_rag, client):
-        mock_rag.corpus_chunks = [object(), object()]
-        mock_rag.append_documents.return_value = None
+    def test_upload_indexes_documents(self, mock_rag, client, monkeypatch, tmp_path):
+        from rag_hybrid.src.retriever.hybrid import DocumentChunk
+
+        monkeypatch.setenv("ADMIN_API_KEY", "test-admin-key")
+        monkeypatch.setenv("RAG_DATA_DIR", str(tmp_path))
+        mock_rag.corpus_chunks = [
+            DocumentChunk(
+                chunk_id=f"saved-{index}",
+                doc_id="saved",
+                text="Saved paper excerpt.",
+                parent_text="Saved paper excerpt.",
+            )
+            for index in range(2)
+        ]
+        mock_rag.replace_sources.return_value = [
+            DocumentChunk(
+                chunk_id="new-1",
+                doc_id="new",
+                text="Python is used for testing.",
+                parent_text="Python is used for testing.",
+            )
+        ]
 
         resp = client.post(
             "/documents",
             files={"files": ("notes.txt", b"Python is used for testing.", "text/plain")},
+            headers={"X-Admin-Key": "test-admin-key"},
         )
 
         assert resp.status_code == 200
@@ -64,7 +84,7 @@ class TestDocumentUpload:
             "chunks_indexed": 1,
             "total_chunks": 2,
         }
-        mock_rag.append_documents.assert_called_once()
+        mock_rag.replace_sources.assert_called_once()
 
 
 def test_extract_claims_ignores_citation_free_fallback():
@@ -135,9 +155,9 @@ class TestQueryEndpoint:
     @patch("rag_hybrid.src.api.app._rag")
     @patch("rag_hybrid.src.api.app._evaluator")
     @patch("rag_hybrid.src.generator.generator.Groq")
-    def test_empty_query_string_returns_400(self, MockGroq, mock_eval, mock_rag, client):
+    def test_empty_query_string_returns_422(self, MockGroq, mock_eval, mock_rag, client):
         resp = client.post("/query", json={"query": ""})
-        assert resp.status_code == 400
+        assert resp.status_code == 422
 
     @patch("rag_hybrid.src.api.app._rag")
     @patch("rag_hybrid.src.api.app._evaluator")
@@ -155,6 +175,7 @@ class TestQueryEndpoint:
         body = resp.json()
         assert "answer" in body
         assert body["citations"] == []
+        assert body["faithfulness_score"] is None
 
     @patch("rag_hybrid.src.api.app._rag")
     @patch("rag_hybrid.src.api.app._evaluator")

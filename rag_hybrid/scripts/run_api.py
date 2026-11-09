@@ -2,7 +2,7 @@
 """Run the RAG API.
 
 Usage:
-    python scripts/run_api.py
+    uvicorn rag_hybrid.src.api.app:app --reload
 """
 
 import uvicorn

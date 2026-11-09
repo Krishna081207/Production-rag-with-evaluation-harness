@@ -21,10 +21,10 @@ def mock_evaluator():
     with patch("rag_hybrid.src.eval.faithfulness.CrossEncoder") as MockCE:
         instance = MockCE.return_value
         # Default: always return entailment prob = 0.9 → verified
-        instance.predict.return_value = np.array([[0.02, 0.08, 0.90]])
+        instance.predict.return_value = np.array([[0.02, 0.90, 0.08]])
         evaluator = FaithfulnessEvaluator.__new__(FaithfulnessEvaluator)
         evaluator.nli = instance
-        evaluator.entail_idx = 2
+        evaluator.entail_idx = 1
         yield evaluator, instance
 
 
@@ -41,10 +41,10 @@ def sample_map():
 # ---------------------------------------------------------------------------
 
 class TestEmptyInput:
-    def test_empty_claims_returns_perfect_score(self, mock_evaluator):
+    def test_empty_claims_have_no_score(self, mock_evaluator):
         evaluator, _ = mock_evaluator
         result = evaluator.evaluate_generation([], {})
-        assert result.faithfulness_score == 1.0
+        assert result.faithfulness_score is None
         assert result.total_claims == 0
         assert result.verified_claims == 0
         assert result.violations == []
@@ -62,7 +62,7 @@ class TestEmptyInput:
 class TestVerifiedClaims:
     def test_single_verified_claim(self, mock_evaluator, sample_map):
         evaluator, nli = mock_evaluator
-        nli.predict.return_value = np.array([[0.02, 0.08, 0.90]])
+        nli.predict.return_value = np.array([[0.02, 0.90, 0.08]])
         claims = [{"claim": "Python is a programming language.", "citation": "c1"}]
         result = evaluator.evaluate_generation(claims, sample_map)
         assert result.verified_claims == 1
@@ -72,7 +72,7 @@ class TestVerifiedClaims:
 
     def test_all_claims_verified(self, mock_evaluator, sample_map):
         evaluator, nli = mock_evaluator
-        nli.predict.return_value = np.array([[0.0, 0.1, 0.90]])
+        nli.predict.return_value = np.array([[0.0, 0.90, 0.1]])
         claims = [
             {"claim": "Python is a programming language.", "citation": "c1"},
             {"claim": "FastAPI is a web framework.", "citation": "c2"},
@@ -96,15 +96,13 @@ class TestHallucinatedClaims:
         assert result.verified_claims == 0
         assert result.faithfulness_score == 0.0
         assert len(result.violations) == 1
-        assert "Hallucination" in result.violations[0]
+        assert "Unsupported claim" in result.violations[0]
 
     def test_mixed_verified_and_hallucinated(self, mock_evaluator, sample_map):
         evaluator, nli = mock_evaluator
-        # First call: entails; second call: contradicts
-        nli.predict.side_effect = [
-            np.array([[0.02, 0.08, 0.90]]),
-            np.array([[0.70, 0.20, 0.10]]),
-        ]
+        nli.predict.return_value = np.array(
+            [[0.02, 0.90, 0.08], [0.70, 0.20, 0.10]]
+        )
         claims = [
             {"claim": "Python is a programming language.", "citation": "c1"},
             {"claim": "Python was invented in 1950.", "citation": "c1"},

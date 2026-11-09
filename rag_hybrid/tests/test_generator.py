@@ -115,7 +115,8 @@ class TestGenerateAnswerWithMockedGroq:
         )
         os.environ["groq"] = "fake-key"
         result = generate_answer("Unknown question.", two_chunks)
-        assert result.citations == []
+        assert result.citations == ["Chunk_c1"]
+        assert "[Chunk_c1]" in result.answer
 
     @patch("rag_hybrid.src.generator.generator.Groq")
     def test_api_error_returns_fallback(self, MockGroq, two_chunks):
@@ -135,7 +136,13 @@ class TestGenerateAnswerWithMockedGroq:
             "Something happened [Chunk_doc1_c0]."
         )
         os.environ["groq"] = "fake-key"
-        result = generate_answer("query", two_chunks)
+        chunk = DocumentChunk(
+            chunk_id="doc1_c0",
+            doc_id="doc1",
+            text="Something happened.",
+            parent_text="Something happened.",
+        )
+        result = generate_answer("query", [chunk])
         assert "Chunk_doc1_c0" in result.citations
 
 

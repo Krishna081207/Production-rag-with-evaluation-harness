@@ -1,314 +1,96 @@
-# Hybrid RAG + Eval Harness: Sprint Plan and Architecture
+# Research Paper Assistant: Architecture and Roadmap
 
-## 1. Project summary
+## Product
 
-**Problem statement**
-Researchers lose time finding specific methods and results across RAG papers. We build a hybrid-retrieval Q&A system with cited answers and an eval harness that measures which retrieval strategy works, where it fails, and what it costs in latency.
+Help a reader understand one or more uploaded research papers. A user can ask about a paper's research question, claimed contributions, study design, datasets, results, comparisons, and stated limitations. Answers cite the retrieved chunks; PDF citations include page numbers. The application can retrieve across multiple uploaded papers, which supports cross-paper comparison when the evidence is present.
 
-**One-line pitch**
-A RAG system that is measured, not just demoed: it cites its sources, says "not found" when the papers don't answer, and shows where it fails.
+The project also includes a retrieval evaluation harness. The harness is a developer tool: it compares retrieval configurations against a reviewed gold set. The checked-in corpus is fictional smoke data and cannot support product quality claims.
 
-**Two deliverables**
-
-| Deliverable | For | Purpose |
-|---|---|---|
-| RAG Q&A system | Users (researchers) | Cited answers in seconds |
-| Eval harness | Builders and reviewers | Proof of quality, failure analysis, regression gate |
-
-**Build approach (open decision, see section 10)**
-Either upgrade the MIT-licensed reference repo `AbhishekRK41/rag-eval-system` (keep the license notice and credit it) or build from scratch. The module layout below mirrors the reference repo, so both paths use the same design.
-
----
-
-## 2. Goals, non-goals, success criteria
-
-**Goals**
-1. Hybrid retrieval (BM25 + dense, RRF fusion) plus a cross-encoder reranker
-2. Cited answers with an honest "not found" path
-3. A verified gold set and a one-command harness that outputs a results table
-4. Automatic failure attribution by pipeline stage
-5. A retrieval-lift measurement against an LLM-only baseline
-6. Runs on a laptop CPU with free-tier LLM access
-
-**Non-goals for Sprint 1**
-Hosting, multi-user auth, GPU use, fine-tuning, UI polish beyond a clear demo.
-
-**Success criteria** (placeholders: set exact targets after the first baseline run, and report misses honestly)
-
-| Claim | Metric | Target |
-|---|---|---|
-| Finds the right evidence | Recall@5 | TBD after baseline |
-| Answers are correct | Key-fact match | TBD after baseline |
-| Does not guess | Abstention accuracy on unanswerable questions | TBD after baseline |
-| Fast on CPU | p95 end-to-end latency | TBD after baseline |
-| Hybrid is worth it | Gain over dense-only baseline | Report the measured gap |
-| RAG helps over the LLM alone | Retrieval lift | Report the measured gap |
-
----
-
-## 3. Users and access
-
-| Side | Who | Uses | Access |
-|---|---|---|---|
-| User | Researcher | Q&A system | Streamlit page, later the `/query` API |
-| Builder | You, maintainers | Eval harness | CLI (`python eval/run_eval.py`), CI gate, `results/` files |
-| Reviewer | Recruiters, engineers | Repo and demo | README, results table, short screen recording |
-
-Users never see chunks, scores, or metrics. They see a question box, a cited answer, and a "not found" state. The harness keeps those answers correct over time.
-
----
-
-## 4. Architecture
+## Current architecture
 
 ```mermaid
-flowchart LR
-  subgraph Offline[Indexing offline]
-    A[PDF papers] --> B[Parse with PyMuPDF]
-    B --> C[Chunk and add metadata]
-    C --> D[Embed with bge-small]
-    C --> E[BM25 index]
-    D --> F[(Chroma)]
-  end
-  subgraph Online[Query online]
-    Q[User question] --> R1[Dense search]
-    Q --> R2[BM25 search]
-    R1 --> X[RRF fusion]
-    R2 --> X
-    X --> RR[Cross-encoder rerank top 10]
-    RR --> G[Generate with Groq or extractive]
-    G --> ANS[Cited answer or not found]
-  end
-  F --> R1
-  E --> R2
-  subgraph Eval[Eval harness offline]
-    GS[gold.jsonl] --> RUN[run_eval.py]
-    RUN --> M[Metrics and failure attribution]
-    M --> T[Results table]
-  end
-  RUN -. calls .-> Q
+flowchart TD
+  UP[PDF, DOCX, Markdown, or UTF-8 text] --> EX[Text extraction]
+  EX --> CH[Page-aware child chunks and parent context]
+  CH --> D[Normalized BGE embeddings]
+  CH --> S[BM25 corpus]
+  D --> V[(Qdrant or Pinecone)]
+  Q[Research question] --> DS[Dense retrieval]
+  Q --> BS[BM25 retrieval]
+  V --> DS
+  S --> BS
+  DS --> RF[Reciprocal Rank Fusion]
+  BS --> RF
+  RF --> CE[Cross-encoder reranking]
+  CE --> GEN[Groq answer or cited extractive fallback]
+  GEN --> NLI[NLI evidence-support estimate]
+  NLI --> OUT[Answer, citations, file/page details, score]
 ```
 
-### 4.1 Components
+### Implemented components
 
-| Stage | Responsibility | Tool | Key decision |
-|---|---|---|---|
-| Parse | PDF to text per page | `pymupdf` | Inspect output; tables will be messy |
-| Chunk | Split text, attach metadata | Recursive splitter, about 400 tokens, 50 overlap | Compare 256 vs 512 later |
-| Embed | Chunk and query vectors | `sentence-transformers`, `bge-small-en-v1.5` | Small model for CPU |
-| Dense index | Vector search | `chromadb` | Store paper, page, chunk id |
-| Sparse index | Keyword search | `rank_bm25` | Same chunks as dense |
-| Fusion | Merge two ranked lists | RRF, score = sum of 1 / (60 + rank) | Ranks only, no score normalisation |
-| Rerank | Re-score top candidates | CrossEncoder `ms-marco-MiniLM-L-6-v2` | Rerank top 10 only (CPU cost) |
-| Generate | Grounded answer with citations | Groq free tier; extractive fallback | Strict "answer only from context" prompt |
-| Eval | Score every config on the gold set | `pandas`, `numpy`, own metrics | Retrieval metrics need no LLM |
-
-Model names are starting points. Confirm they download and run on your machine, and let eval numbers decide whether to change them.
-
-### 4.2 Run modes
-
-| Mode | LLM | Use |
-|---|---|---|
-| `retrieval_only` | No | Returns top chunks with sources. Free and fast |
-| `extractive` | No | Returns the best sentence from the top chunk |
-| `full_rag` | Yes | LLM writes a cited answer |
-| `llm_only` | Yes | Baseline with no retrieval, used to measure retrieval lift |
-
-### 4.3 Retrieval configs (ablation matrix)
-
-| ID | Dense | BM25 | RRF | Rerank |
-|---|---|---|---|---|
-| C1 | yes | no | no | no |
-| C2 | no | yes | no | no |
-| C3 | yes | yes | yes | no |
-| C4 | yes | yes | yes | yes |
-
-Stretch variants: chunk size 256 vs 512, final k of 3 vs 5.
-
-### 4.4 Cross-cutting design rules
-1. **Corpus is pluggable.** Paths and settings come from `corpus.yaml`, so a second corpus needs only a new config and a gold file.
-2. **Cache everything.** Embeddings and every LLM response are cached to disk keyed by input hash. Reruns cost nothing.
-3. **Retrieval metrics first.** Run all configs without the LLM. Generate and judge only on the best 2-3 configs.
-4. **Secrets in `.env`, never committed.** `.env.example` documents the variables.
-5. **Log latency per stage** (retrieve, rerank, generate) and the number of LLM calls per query.
-
----
-
-## 5. Data design
-
-**Repo structure**
-```
-rag-harness/
-  corpus.yaml
-  data/papers/  data/text/
-  gold/gold.jsonl
-  src/
-    ingest.py  chunk.py  index.py  retrieve.py  rerank.py  generate.py
-  eval/
-    metrics.py  run_eval.py  attribute_failures.py
-  results/
-  tests/
-  app.py                      # Streamlit demo
-  README.md  requirements.txt  .env.example
-  (Sprint 2) api/main.py  Dockerfile  .github/workflows/eval.yml
-```
-
-**Parsed page row** (`data/text/<paper>.jsonl`)
-```json
-{"paper": "dpr", "title": "...", "arxiv": "2004.04906", "page": 3, "text": "..."}
-```
-
-**Chunk row**
-```json
-{"chunk_id": "dpr_p3_c2", "paper": "dpr", "page": 3, "text": "...", "n_tokens": 380}
-```
-
-**Gold row** (`gold/gold.jsonl`)
-```json
-{
-  "id": "q001",
-  "type": "fact | number | method | comparison | unanswerable",
-  "question": "<question you can verify in the paper>",
-  "answerable": true,
-  "gold_answer": "<short verified answer>",
-  "key_facts": ["<phrase that must appear>"],
-  "gold_sources": [{"paper": "<key>", "page": 0}]
-}
-```
-Unanswerable questions use `"answerable": false` and empty `gold_sources`.
-
-**Gold set rules**
-- 30 questions for Sprint 1, mix: about 10 fact or number, 8 method, 5 comparison across papers, 5 unanswerable, 2 spare
-- Claude may draft candidates from chunks, but **you verify every answer against the paper**
-- Check that unanswerable questions really are not answered in the corpus
-- Fix the gold set before tuning anything
-
-**Results output**
-`results/run_<timestamp>.json` (per-question logs) and `results/results_table.md`.
-
----
-
-## 6. Evaluation design
-
-**Metrics**
-
-| Group | Metric | Needs LLM |
-|---|---|---|
-| Retrieval | Recall@5, Hit rate@5, MRR, nDCG@5 | No |
-| Answer | Key-fact match (normalised phrase check) | No |
-| Answer | Citation match (cited paper and page vs gold) | No |
-| Answer | Abstention accuracy (refuses unanswerable, answers answerable) | Mostly no |
-| Answer | Faithfulness (claims supported by context) | Yes, sampled |
-| System | Latency p50 and p95 per stage, LLM calls per query | No |
-| Comparison | Retrieval lift = key-fact match (full_rag) minus key-fact match (llm_only) | Yes |
-
-**Failure attribution** (applied to every wrong answer, first matching rule wins)
-
-| Stage | Rule |
+| Stage | Implementation |
 |---|---|
-| Parse | Gold fact is not present in the parsed page text |
-| Chunk | Gold fact is not fully inside any single chunk |
-| Retrieve | Gold chunk is not in the candidate pool before reranking |
-| Rerank or cutoff | Gold chunk was in the pool but not in the final top-k |
-| Generate | Gold chunk was in the context but the answer is wrong |
-| Abstention | An unanswerable question was answered, or an answerable one was refused |
+| Parsing | PyMuPDF extracts PDF text by page. DOCX paragraphs and tables, Markdown, and UTF-8 text are supported. |
+| Chunking | 300-word child chunks. Groups of up to four children share parent context. PDF page boundaries are retained. |
+| Dense retrieval | `BAAI/bge-small-en-v1.5` embeddings stored in Qdrant or optional Pinecone. |
+| Sparse retrieval | BM25 over the same child chunks, restored from an atomic JSONL corpus snapshot. |
+| Fusion | Reciprocal Rank Fusion with `k=60`. |
+| Reranking | `cross-encoder/ms-marco-MiniLM-L-6-v2` scores the fused candidate set. |
+| Generation | Groq model configured with `GROQ_MODEL`; defaults to `openai/gpt-oss-20b`. Without a Groq key or on generation failure, the first sentence from the top parent chunk is returned with a citation. |
+| Citation checks | Every generated factual sentence must have a retrieved chunk citation. Unsupported or invalid citations fall back to an extractive answer. |
+| Evidence scoring | `cross-encoder/nli-deberta-v3-small` estimates entailment between each claim and its cited parent text. Empty answers have no score. |
+| API and UI | FastAPI for query/ingestion and Streamlit for upload, questions, citations, and evidence status. |
+| Storage | Qdrant can use memory, a local path, or a remote URL. The API persists BM25 chunks as JSONL. Docker Compose uses a named volume. |
+| Evaluation | C1 dense, C2 BM25, C3 hybrid RRF, and C4 hybrid RRF with reranking; reports Recall@k, hit rate, MRR, nDCG, and retrieval latency. |
 
-**Judge handling**
-- Use a model different from the answer model where possible
-- Judge a sample of about 15-30 answers, cache every judgement
-- Hand-label the same sample and report agreement between judge and you
+## Data contracts
 
-**Reporting rules**
-- Every README claim points to a metric or a file
-- Report configs where an intervention did not help, and say why
-- State the gold set size next to every table
+A chunk stores `chunk_id`, `doc_id`, child `text`, `parent_text`, `source_name`, and optional one-based `page_number`. The same serialized chunk is used in the vector metadata/payload and the saved sparse corpus. Chunk identifiers include a content-and-path hash to avoid collisions between same-named files. Re-ingesting an unchanged source is idempotent; a changed file at the same source path replaces its older chunks. Use distinct filenames to retain multiple paper versions.
 
----
+Each answer citation refers to a chunk ID in the retrieved context. The UI maps that ID back to a filename and, when available, a PDF page. NLI checks the claim against the citation's parent text, not against the whole retrieved context.
 
-## 7. Sprint plan
+## Quality boundaries
 
-Time estimates are rough and assume focused work on a laptop.
+- The smoke corpus is fictional and has seven hand-authored retrieval questions. It proves only that the evaluation path is wired correctly.
+- There is no reviewed real-paper benchmark yet, and CI does not gate scientific answer correctness.
+- Retrieval metrics do not measure whether generated answers preserve nuance, units, uncertainty, or author attribution.
+- NLI evidence scores are estimates; scientific claims still need review against the paper.
+- Scanned PDFs, equations, figures, and complex PDF tables need OCR or specialized extraction. Current parsing is text-only.
+- DOCX, Markdown, and text citations identify the file and chunk, not a page.
+- Uploads require `ADMIN_API_KEY`. Query routes are open by default; deployment should add access control at the application or trusted proxy layer.
 
-### Sprint 1: MVP, ships tomorrow (about 11 hours)
+## Roadmap
 
-**Goal:** a working cited Q&A system, a verified 30-question gold set, and a results table for four configs.
+### 1. Build a real paper evaluation set
 
-| Block | Time | Tasks | Done when |
-|---|---|---|---|
-| 1. Ingest | 1.5 h | Verify 8 paper IDs, run `ingest.py`, run `check_text.py`, read samples | 8 `.jsonl` files, text reads in order |
-| 2. Retrieval | 2 h | Chunking with metadata, embeddings, Chroma, BM25, RRF, `retrieve(query, mode, k)` | All four configs return ranked chunks |
-| 3. Gold set | 2.5 h | Write and verify 30 questions with answers, key facts, sources | `gold.jsonl` validated |
-| 4. Harness | 2 h | `metrics.py`, `run_eval.py`, latency timers, results table | One command prints the table for C1-C4 |
-| 5. Generation | 1.5 h | Grounded prompt, citations, "not found" rule, cache, `llm_only` baseline; generate on best 2 configs; judge a sample | Answer metrics and retrieval lift |
-| 6. Demo and docs | 1.5 h | `attribute_failures.py`, Streamlit screen, README, screenshots, short recording | Repo ready to share |
+Choose a small, openly licensed collection of papers and manually verify every question, answer, source chunk, and page. Include factual questions, methods, numerical results, cross-paper comparisons, conflicting results, and unanswerable questions. Track paper IDs and benchmark version. Keep the synthetic smoke set for CI wiring.
 
-**Definition of done**
-- [ ] `python eval/run_eval.py` reproduces the results table
-- [ ] README contains the table, failure breakdown, and one finding
-- [ ] Demo shows a cited answer and a "not found" case
-- [ ] No keys in the repo
-- [ ] A few `pytest` tests cover metrics and RRF
+### 2. Measure answer quality
 
-**Cut order if time runs short:** judge sample, nDCG, Streamlit polish, recording. Never cut the gold set. If only 20 good questions are ready, ship with 20 and say so.
+Add answer-level metrics: key-fact coverage, citation source/page match, unsupported-claim rate, and abstention precision/recall. Save per-question retrieved chunks, generated answer, citations, and latency so failures can be assigned to parsing, chunking, retrieval, reranking, generation, or abstention.
 
-### Sprint 2: Productionise (about 1-2 days)
-- FastAPI `/query`, `/health`, `/eval-report`
-- Dockerfile and docker compose
-- GitHub Actions: run the eval on pull requests, fail when a metric drops below baseline
-- Unit tests for retrieval and metrics
-- Query caching and structured logs
+### 3. Improve paper structure extraction
 
-**Done when:** a pull request that degrades retrieval fails CI, demonstrated once.
+Retain PDF metadata, headings, abstract and section boundaries. Evaluate chunk sizes and overlap with the reviewed gold set. Add OCR and equation/table extraction only with dedicated fixtures and evaluation cases.
 
-### Sprint 3: Generalise and deepen (about 1-2 days)
-- Second corpus (for example MRL/AMU documents, your notes, or university ordinances) with about 20 verified questions
-- Counterfactual grounding test: edit a number in a document copy and confirm the answer changes
-- Judge validation: report agreement with your hand labels
-- Query transformations (rewrite, multi-query, HyDE) tested through the harness
-- Chunk size and k ablations
+### 4. Harden deployment
 
-**Done when:** the same harness produces comparable tables on both corpora.
+Add query authentication and user/corpus isolation before exposing the app to multiple users. Add request IDs, structured latency logs, rate limits, retention controls, and a documented backup/restore procedure for vector and corpus storage.
 
-### Sprint 4: Showcase (about half a day)
-- Public README with architecture diagram, results, failure analysis, limitations
-- 60-90 second screen recording or GIF
-- Optional hosted demo with extractive mode as default
-- Short write-up of the main findings
+### 5. Keep experiments reproducible
 
----
+Record model IDs, chunking settings, retrieval parameters, corpus version, and dependency versions with each benchmark result. Add a lock file after selecting a supported deployment environment and verify CPU memory/latency costs on the target host.
 
-## 8. Risks and mitigations
+## Commands
 
-| Risk | Impact | Mitigation |
-|---|---|---|
-| Gold set takes longer than planned | Delays everything | Start drafting questions during Block 1; ship with fewer verified questions rather than sloppy ones |
-| PDF text is jumbled (two-column layout, tables) | Parse and chunk failures | Inspect early; adjust extraction; note limits in README |
-| LLM already knows famous papers | Inflates results | `llm_only` baseline and retrieval lift |
-| Free-tier rate limits | Blocks generation runs | Cache, retrieval-only evals first, generate on top configs only, extractive fallback |
-| Slow reranker on CPU | Latency | Rerank top 10 only; report latency as a result |
-| Small gold set | Noisy conclusions | State n beside every table; avoid strong claims on small differences |
-| Dense retriever or reranker underperforms | Weak headline | Report honestly with a hypothesis |
+From the repository root:
 
----
+```bash
+uvicorn rag_hybrid.src.api.app:app --reload
+streamlit run rag_hybrid/scripts/app_streamlit.py
+python rag_hybrid/scripts/ingest.py --source rag_hybrid/data/papers
+python -m rag_hybrid.eval.run_eval --chunks rag_hybrid/eval/data/sample_chunks.jsonl --gold rag_hybrid/eval/data/sample_gold.jsonl
+```
 
-## 9. Showcase plan
-
-| Item | Content |
-|---|---|
-| Streamlit app | Cited answer, "not found" state |
-| CLI harness | Results table for C1-C4 |
-| README | Problem, architecture, results, failure breakdown, limitations |
-| Recording (2 min) | Problem (10 s), demo (40 s), harness (40 s), one finding (20 s), failures (10 s) |
-
-If hosting a public demo, store keys in the platform's secrets, and default to a mode that does not spend LLM quota.
-
----
-
-## 10. Open decisions and assumptions
-
-| Item | Status |
-|---|---|
-| Fork and upgrade `rag-eval-system` vs build from scratch | Open. Forking is faster; building teaches more. Credit the reference either way |
-| Paper IDs | Taken from memory; verify each download matches the intended title |
-| Model names | Starting points; confirm they work on your CPU |
-| Groq free-tier limits | Sources disagree; check your own console |
-| Success targets | Set after the first baseline run |
+See the root [README](../README.md) for installation, environment variables, API examples, and Docker Compose setup.

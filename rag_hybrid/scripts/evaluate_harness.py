@@ -1,23 +1,8 @@
-# scripts/evaluate_harness.py
-"""Evaluation harness for the rag_hybrid system.
+"""Run a tiny local demo and report citation coverage and lexical diversity.
 
-This script runs a few example queries through the full RAG pipeline and
-computes two key metrics:
-
-* **Hallucination rate** – fraction of generated sentences that do *not*
-  contain a citation placeholder ``[Chunk_<ID>]``.  A lower rate indicates the
-  LLM respects the citation contract.
-* **MMR (Maximum Marginal Relevance) score** – a simple diversity‑relevance
-  measure for the retrieved chunks.  We approximate relevance by the rank order
-  (higher rank => higher relevance) and diversity by the average Jaccard
-  similarity of token sets between chunks.  The final score is normalized to
-  ``[0, 1]`` where a higher value means more diverse and still relevant
-  retrieval.
-
-The script is deliberately lightweight and does not require any external data
-files; it uses the ``ProductionHybridRAG`` class to index a tiny synthetic
-corpus defined inline.  This makes it suitable for CI runs where a full data
-set may not be available.
+These format and diversity proxies do not measure factual hallucination or
+answer quality. Use rag_hybrid.eval.run_eval with a verified gold set for
+retrieval metrics.
 """
 
 import re
@@ -26,124 +11,109 @@ from typing import List, Tuple
 from rag_hybrid.src.generator.generator import generate_answer
 from rag_hybrid.src.retriever.hybrid import DocumentChunk, ProductionHybridRAG
 
-# ---------------------------------------------------------------------------
-# Helper utilities
-# ---------------------------------------------------------------------------
-CITATION_REGEX = re.compile(r"\[Chunk_([^\]]+)\]")
+CITATION_REGEX = re.compile(r"\[Chunk_[^\]]+\]")
+ABSTENTION = "The provided documentation does not contain sufficient evidence to answer this inquiry."
 
 
 def _split_sentences(text: str) -> List[str]:
-    """Very naive sentence splitter – split on period followed by space.
-    Sufficient for the demo harness.
-    """
-    return [s.strip() for s in text.split(".") if s.strip()]
+    return [part.strip() for part in re.split(r"(?<=[.!?])\s+", text.strip()) if part.strip()]
+
+
+def uncited_sentence_rate(answer: str) -> float:
+    sentences = _split_sentences(answer)
+    if not sentences or answer.strip() == ABSTENTION:
+        return 0.0
+    uncited = sum(1 for sentence in sentences if not CITATION_REGEX.search(sentence))
+    return uncited / len(sentences)
 
 
 def hallucination_rate(answer: str) -> float:
-    """Return the proportion of sentences *without* a citation.
-
-    Parameters
-    ----------
-    answer: str
-        The generated answer string.
-    """
-    sentences = _split_sentences(answer)
-    if not sentences:
-        return 0.0
-    without_citation = sum(1 for s in sentences if not CITATION_REGEX.search(s))
-    return without_citation / len(sentences)
+    """Compatibility alias; missing citations are not proof of hallucination."""
+    return uncited_sentence_rate(answer)
 
 
-def _jaccard(set_a: set, set_b: set) -> float:
+def _jaccard(set_a: set[str], set_b: set[str]) -> float:
     if not set_a and not set_b:
         return 0.0
     return len(set_a & set_b) / len(set_a | set_b)
 
 
-def mmr_score(chunks: List[DocumentChunk], lambda_rel: float = 0.5) -> float:
-    """Compute a simplified MMR‑like score.
-
-    *Relevance* is approximated by the inverse of the rank (higher rank → higher
-    relevance).  *Diversity* is measured by the average pairwise Jaccard
-    similarity of token sets; we subtract that from 1 to get a novelty term.
-    The final score is ``lambda * relevance - (1-lambda) * similarity`` and is
-    scaled to ``[0, 1]``.
-    """
+def retrieval_diversity_proxy(chunks: List[DocumentChunk], lambda_rel: float = 0.5) -> float:
+    """Combine rank position with lexical diversity; this is not true MMR."""
     if not chunks:
         return 0.0
-    # Relevance component – normalized sum of (1 / rank)
-    relevance = sum(1.0 / (i + 1) for i in range(len(chunks)))
-    relevance /= len(chunks)  # now in (0,1]
+    if not 0.0 <= lambda_rel <= 1.0:
+        raise ValueError("lambda_rel must be between 0 and 1")
+    relevance = sum(1.0 / (rank + 1) for rank in range(len(chunks))) / len(chunks)
+    token_sets = [set(chunk.text.lower().split()) for chunk in chunks]
+    similarities = [
+        _jaccard(token_sets[i], token_sets[j])
+        for i in range(len(token_sets))
+        for j in range(i + 1, len(token_sets))
+    ]
+    novelty = 1.0 - (sum(similarities) / len(similarities) if similarities else 0.0)
+    return max(0.0, min(1.0, lambda_rel * relevance + (1.0 - lambda_rel) * novelty))
 
-    # Diversity component – average pairwise Jaccard similarity of token sets
-    token_sets = [set(c.text.lower().split()) for c in chunks]
-    sims = []
-    for i in range(len(token_sets)):
-        for j in range(i + 1, len(token_sets)):
-            sims.append(_jaccard(token_sets[i], token_sets[j]))
-    if sims:
-        avg_sim = sum(sims) / len(sims)
-    else:
-        avg_sim = 0.0
-    novelty = 1.0 - avg_sim  # higher is better
 
-    # Combine
-    score = lambda_rel * relevance + (1 - lambda_rel) * novelty
-    # Clamp to [0,1]
-    return max(0.0, min(1.0, score))
+def mmr_score(chunks: List[DocumentChunk], lambda_rel: float = 0.5) -> float:
+    """Compatibility alias for the lexical diversity proxy."""
+    return retrieval_diversity_proxy(chunks, lambda_rel=lambda_rel)
 
-# ---------------------------------------------------------------------------
-# Simple synthetic corpus for CI – three short docs
-# ---------------------------------------------------------------------------
+
 SYNTHETIC_DOCS = [
-    ("doc1", "Python is a programming language. It is dynamically typed and popular for data science."),
-    ("doc2", "FastAPI is a modern web framework for building APIs with Python. It uses ASGI and type hints."),
-    ("doc3", "Qdrant is a vector database that supports similarity search with cosine distance."),
+    (
+        "retrieval_paper",
+        "This fictional paper asks whether hybrid retrieval improves research evidence search. "
+        "It compares BM25, dense retrieval, and reciprocal rank fusion on a small synthetic corpus.",
+    ),
+    (
+        "methods_paper",
+        "This fictional methods paper describes a study with manually reviewed questions and "
+        "Recall at 5 and mean reciprocal rank as retrieval metrics.",
+    ),
+    (
+        "limitations_paper",
+        "This fictional paper notes that a small single-domain corpus limits generalization. "
+        "It also says automated evidence checks do not replace domain expert review.",
+    ),
 ]
 
 
-def build_corpus() -> List[DocumentChunk]:
-    rag = ProductionHybridRAG()
+def build_corpus() -> Tuple[List[DocumentChunk], ProductionHybridRAG]:
+    rag = ProductionHybridRAG(vector_db="qdrant", qdrant_path=":memory:")
     all_chunks: List[DocumentChunk] = []
-    for doc_id, txt in SYNTHETIC_DOCS:
-        # Use a very small child chunk size for the demo
+    for doc_id, text in SYNTHETIC_DOCS:
+        sentences = [sentence.strip() for sentence in text.split(".") if sentence.strip()]
         all_chunks.extend(
             DocumentChunk(
-                chunk_id=f"{doc_id}_c{i}",
+                chunk_id=f"{doc_id}_c{index}",
                 doc_id=doc_id,
-                text=chunk,
-                parent_text=txt,
+                text=sentence,
+                parent_text=text,
             )
-            for i, chunk in enumerate(txt.split(".")[:-1])  # drop empty last split
+            for index, sentence in enumerate(sentences)
         )
     rag.index_documents(all_chunks)
     return all_chunks, rag
 
 
 def evaluate_query(rag: ProductionHybridRAG, query: str) -> Tuple[float, float]:
-    """Run a single query and return (hallucination_rate, mmr_score)."""
     retrieved = rag.hybrid_retrieve(query, top_candidates=5, final_k=3)
-    gen_res = generate_answer(query, retrieved)
-    h_rate = hallucination_rate(gen_res.answer)
-    m_score = mmr_score(retrieved)
-    return h_rate, m_score
+    generated = generate_answer(query, retrieved)
+    return uncited_sentence_rate(generated.answer), retrieval_diversity_proxy(retrieved)
 
 
-def main():
-    # Build a tiny in‑memory index – this is fast enough for CI.
+def main() -> None:
     _, rag = build_corpus()
-
-    sample_queries = [
-        "What is Python?",
-        "Explain FastAPI.",
-        "What does Qdrant do?",
-    ]
-
-    for q in sample_queries:
-        h_rate, m_score = evaluate_query(rag, q)
-        print(f"Query: {q}")
-        print(f"  Hallucination rate: {h_rate:.2%}")
-        print(f"  MMR score: {m_score:.2%}\n")
+    for question in (
+        "What research question does the retrieval paper ask?",
+        "Which metrics are used in the methods paper?",
+        "What limitations do the fictional papers report?",
+    ):
+        uncited_rate, diversity = evaluate_query(rag, question)
+        print(f"Question: {question}")
+        print(f"  Uncited-sentence rate (format proxy): {uncited_rate:.2%}")
+        print(f"  Retrieval-diversity proxy: {diversity:.2%}\n")
 
 
 if __name__ == "__main__":

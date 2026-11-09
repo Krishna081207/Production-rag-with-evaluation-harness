@@ -1,0 +1,7 @@
+{"id":"q1","question":"What research question does the hybrid retrieval paper investigate?","gold_chunks":["study-a-question"]}
+{"id":"q2","question":"How many labeled questions and papers are in the retrieval study?","gold_chunks":["study-a-question"]}
+{"id":"q3","question":"What Recall at 5 did reciprocal rank fusion achieve in the fictional study?","gold_chunks":["study-a-results"]}
+{"id":"q4","question":"What limitations do the authors report for the retrieval study?","gold_chunks":["study-a-limits"]}
+{"id":"q5","question":"How does the citation study check whether a source supports a factual claim?","gold_chunks":["study-b-method"]}
+{"id":"q6","question":"What does the fictional citation study report about citation precision and claim support?","gold_chunks":["study-b-results"]}
+{"id":"q7","question":"Why should the citation evaluation not replace expert review?","gold_chunks":["study-b-limits"]}

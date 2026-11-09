@@ -1,0 +1,117 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+
+permissions:
+  contents: read
+
+env:
+  PYTHON_VERSION: "3.11"
+  HF_HOME: ${{ runner.temp }}/huggingface
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - run: python -m pip install "ruff>=0.6,<1"
+      - run: ruff check . --output-format=github
+
+  test:
+    name: Tests (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    needs: lint
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - uses: actions/cache@v4
+        with:
+          path: ${{ env.HF_HOME }}
+          key: hf-models-${{ runner.os }}-${{ matrix.python-version }}-${{ hashFiles('pyproject.toml') }}
+          restore-keys: |
+            hf-models-${{ runner.os }}-${{ matrix.python-version }}-
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install -e ".[dev,pinecone]"
+      - name: Run tests
+        env:
+          VECTOR_DB: qdrant
+        run: >-
+          pytest
+          --cov=rag_hybrid
+          --cov-report=term-missing
+          --cov-report=xml:coverage.xml
+          -p no:warnings
+      - uses: actions/upload-artifact@v4
+        if: matrix.python-version == '3.11'
+        with:
+          name: coverage-report
+          path: coverage.xml
+          retention-days: 7
+
+  evaluate:
+    name: Retrieval evaluation smoke run
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - uses: actions/cache@v4
+        with:
+          path: ${{ env.HF_HOME }}
+          key: hf-models-${{ runner.os }}-eval-${{ hashFiles('pyproject.toml') }}
+          restore-keys: |
+            hf-models-${{ runner.os }}-eval-
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install -e ".[dev,pinecone]"
+      - name: Run retrieval evaluation on the checked-in smoke corpus
+        env:
+          VECTOR_DB: qdrant
+        run: >-
+          python -m rag_hybrid.eval.run_eval
+          --chunks rag_hybrid/eval/data/sample_chunks.jsonl
+          --gold rag_hybrid/eval/data/sample_gold.jsonl
+          --output eval_output.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: retrieval-evaluation
+          path: eval_output.txt
+          if-no-files-found: ignore
+          retention-days: 14
+
+  docker:
+    name: Docker build
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          push: false
+          tags: rag-hybrid-eval:ci-${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

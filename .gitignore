@@ -1,0 +1,44 @@
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials.json
+token.json
+
+# Python environments, bytecode, and build output
+.venv/
+venv/
+ENV/
+env/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Test, lint, and coverage output
+.pytest_cache/
+.ruff_cache/
+.coverage*
+coverage.xml
+htmlcov/
+eval_output.txt
+
+# Local indexes, uploaded files, and evaluation run artifacts
+rag_hybrid/data/qdrant/
+rag_hybrid/data/corpus.jsonl
+rag_hybrid/data/uploads/
+rag_hybrid/data/papers/
+rag_hybrid/results/
+
+# Editors and operating systems
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+desktop.ini

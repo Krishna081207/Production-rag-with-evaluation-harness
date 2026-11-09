@@ -1,292 +1,458 @@
-'''Hybrid Retrieval & Reranking implementation.
-
-- Dense vector search via Qdrant or Pinecone (Sentence-Transformer embeddings)
-- Sparse BM25 search (rank-bm25)
-- Reciprocal Rank Fusion (RRF) to combine both rankings
-- Cross-Encoder reranker (MiniLM-MS-MARCO style) for final top-N selection
-'''
+"""Hybrid dense and BM25 retrieval with RRF fusion and cross-encoder reranking."""
 
 import os
+import re
+import threading
 import uuid
-from typing import Dict, List, Optional
+from collections.abc import Iterable
 
 from dotenv import load_dotenv
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field
 from qdrant_client import QdrantClient
-from qdrant_client.models import Distance, PointStruct, VectorParams
+from qdrant_client.models import Distance, PointIdsList, PointStruct, VectorParams
 from rank_bm25 import BM25Okapi
 from sentence_transformers import CrossEncoder, SentenceTransformer
 
 load_dotenv()
 
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5")
+RERANKER_MODEL = os.getenv("RERANKER_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2")
+EMBEDDING_DIMENSION = 384
+QUERY_INSTRUCTION = "Represent this sentence for searching relevant passages: "
 
-# ----------------------------------------------------------------------
-#   Data models
-# ----------------------------------------------------------------------
+
 class DocumentChunk(BaseModel):
-    """A child chunk that will be indexed.
+    """A retrievable child chunk and its broader generation context."""
 
-    Attributes
-    ----------
-    chunk_id: str
-        Unique identifier for the child chunk.
-    doc_id: str
-        Identifier of the parent document.
-    text: str
-        The child chunk text (used for dense & sparse retrieval).
-    parent_text: str
-        The surrounding parent chunk (used for generation context).
-    """
+    model_config = ConfigDict(extra="forbid")
 
     chunk_id: str
     doc_id: str
     text: str
     parent_text: str
+    source_name: str | None = None
+    page_number: int | None = Field(default=None, ge=1)
 
 
-# ----------------------------------------------------------------------
-#   Hybrid retriever class
-# ----------------------------------------------------------------------
+def _tokenize(text: str) -> list[str]:
+    return re.findall(r"[\w]+", text.lower(), flags=re.UNICODE)
+
+
 class ProductionHybridRAG:
-    """End-to-end hybrid retrieval pipeline supporting Qdrant and Pinecone.
+    """Hybrid retriever backed by Qdrant or Pinecone.
 
-    Parameters
-    ----------
-    collection_name: str, optional
-        Name of the collection / index (defaults to "rag-hybrid" for Pinecone
-        or "private_corpus" for Qdrant).
-    vector_db: str, optional
-        Vector database backend to use: "qdrant" or "pinecone".
-        If omitted, defaults to the VECTOR_DB env variable or "qdrant".
-    pinecone_api_key: str, optional
-        Pinecone API key. If omitted, read from PINECONE_API_KEY or db_key env vars.
-    pinecone_cloud: str, optional
-        Pinecone serverless cloud provider (default "aws").
-    pinecone_region: str, optional
-        Pinecone serverless region (default "us-east-1").
+    Qdrant uses a remote server when ``QDRANT_URL`` is set, persistent local
+    storage when ``QDRANT_PATH`` is set, and in-memory storage otherwise.
+    Model weights are loaded only when indexing or retrieval needs them.
     """
 
     def __init__(
         self,
-        collection_name: Optional[str] = None,
-        vector_db: Optional[str] = None,
-        pinecone_api_key: Optional[str] = None,
-        pinecone_cloud: str = "aws",
-        pinecone_region: str = "us-east-1",
+        collection_name: str | None = None,
+        vector_db: str | None = None,
+        pinecone_api_key: str | None = None,
+        pinecone_cloud: str | None = None,
+        pinecone_region: str | None = None,
+        qdrant_url: str | None = None,
+        qdrant_path: str | None = None,
+        embedding_model: str | None = None,
+        reranker_model: str | None = None,
     ):
-        # Resolve vector DB choice
-        db_choice = (vector_db or os.getenv("VECTOR_DB", "qdrant")).strip().lower()
-        self.vector_db = db_choice
+        self.vector_db = (vector_db or os.getenv("VECTOR_DB", "qdrant")).strip().lower()
+        if self.vector_db not in {"qdrant", "pinecone"}:
+            raise ValueError("VECTOR_DB must be either 'qdrant' or 'pinecone'")
 
-        # Default collection / index name
-        if collection_name:
-            self.collection_name = collection_name
-        elif self.vector_db == "pinecone":
-            self.collection_name = os.getenv("PINECONE_INDEX_NAME", "rag-hybrid")
-        else:
-            self.collection_name = "private_corpus"
+        self.collection_name = collection_name or (
+            os.getenv("PINECONE_INDEX_NAME", "rag-hybrid")
+            if self.vector_db == "pinecone"
+            else os.getenv("QDRANT_COLLECTION_NAME", "rag-hybrid")
+        )
+        self.embedding_model_name = embedding_model or EMBEDDING_MODEL
+        self.reranker_model_name = reranker_model or RERANKER_MODEL
+        self._dense_model: SentenceTransformer | None = None
+        self._reranker: CrossEncoder | None = None
+        self.bm25: BM25Okapi | None = None
+        self.corpus_chunks: list[DocumentChunk] = []
+        self._corpus_lock = threading.RLock()
 
-        self.dense_model = SentenceTransformer("BAAI/bge-small-en-v1.5")
-        self.reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
-        self.bm25: Optional[BM25Okapi] = None
-        self.corpus_chunks: List[DocumentChunk] = []
+        self.pinecone = None
+        self.pinecone_index = None
+        self.qdrant = None
 
-        # Initialize vector database client
         if self.vector_db == "pinecone":
-            from pinecone import Pinecone, ServerlessSpec
-
-            api_key = (
-                pinecone_api_key
-                or os.getenv("PINECONE_API_KEY")
-                or os.getenv("db_key")
+            self._initialize_pinecone(
+                pinecone_api_key=pinecone_api_key,
+                pinecone_cloud=pinecone_cloud,
+                pinecone_region=pinecone_region,
             )
-            if not api_key:
-                raise ValueError(
-                    "Pinecone API key not found. Set PINECONE_API_KEY or db_key in your .env file."
-                )
-
-            self.pinecone = Pinecone(api_key=api_key)
-            # Create serverless index if it doesn't already exist
-            if not self.pinecone.has_index(self.collection_name):
-                self.pinecone.create_index(
-                    name=self.collection_name,
-                    dimension=384,
-                    metric="cosine",
-                    spec=ServerlessSpec(cloud=pinecone_cloud, region=pinecone_region),
-                )
-            self.pinecone_index = self.pinecone.Index(self.collection_name)
-            self.qdrant = None
         else:
-            # Default: in-memory Qdrant client
+            self._initialize_qdrant(qdrant_url=qdrant_url, qdrant_path=qdrant_path)
+
+    @property
+    def dense_model(self) -> SentenceTransformer:
+        if self._dense_model is None:
+            self._dense_model = SentenceTransformer(self.embedding_model_name)
+        return self._dense_model
+
+    @property
+    def reranker(self) -> CrossEncoder:
+        if self._reranker is None:
+            self._reranker = CrossEncoder(self.reranker_model_name)
+        return self._reranker
+
+    def _initialize_qdrant(self, qdrant_url: str | None, qdrant_path: str | None) -> None:
+        resolved_url = qdrant_url or os.getenv("QDRANT_URL")
+        resolved_path = qdrant_path or os.getenv("QDRANT_PATH")
+        if qdrant_path == ":memory:":
             self.qdrant = QdrantClient(":memory:")
+        elif resolved_url:
+            self.qdrant = QdrantClient(url=resolved_url)
+        elif resolved_path and resolved_path != ":memory:":
+            os.makedirs(os.path.dirname(os.path.abspath(resolved_path)), exist_ok=True)
+            self.qdrant = QdrantClient(path=resolved_path)
+        else:
+            self.qdrant = QdrantClient(":memory:")
+
+        if not self.qdrant.collection_exists(self.collection_name):
             self.qdrant.create_collection(
                 collection_name=self.collection_name,
-                vectors_config=VectorParams(size=384, distance=Distance.COSINE),
+                vectors_config=VectorParams(size=EMBEDDING_DIMENSION, distance=Distance.COSINE),
             )
-            self.pinecone = None
-            self.pinecone_index = None
 
-    # ------------------------------------------------------------------
-    #   Indexing
-    # ------------------------------------------------------------------
-    def index_documents(self, chunks: List[DocumentChunk]) -> None:
-        """Ingest dense vectors into the vector DB and build the BM25 index."""
-        self.corpus_chunks = chunks
+    def _initialize_pinecone(
+        self,
+        pinecone_api_key: str | None,
+        pinecone_cloud: str | None,
+        pinecone_region: str | None,
+    ) -> None:
+        api_key = pinecone_api_key or os.getenv("PINECONE_API_KEY") or os.getenv("db_key")
+        if not api_key:
+            raise ValueError("PINECONE_API_KEY is required when VECTOR_DB=pinecone")
+        try:
+            from pinecone import Pinecone, ServerlessSpec
+        except ImportError as exc:
+            raise RuntimeError(
+                "Pinecone support is optional; install it with `pip install -e '.[pinecone]'`."
+            ) from exc
+
+        self.pinecone = Pinecone(api_key=api_key)
+        if not self.pinecone.has_index(self.collection_name):
+            self.pinecone.create_index(
+                name=self.collection_name,
+                dimension=EMBEDDING_DIMENSION,
+                metric="cosine",
+                spec=ServerlessSpec(
+                    cloud=pinecone_cloud or os.getenv("PINECONE_CLOUD", "aws"),
+                    region=pinecone_region or os.getenv("PINECONE_REGION", "us-east-1"),
+                ),
+            )
+        self.pinecone_index = self.pinecone.Index(self.collection_name)
+
+    def _encode(self, texts: list[str]):
+        embeddings = self.dense_model.encode(
+            texts,
+            batch_size=64,
+            show_progress_bar=False,
+            normalize_embeddings=True,
+        )
+        shape = getattr(embeddings, "shape", ())
+        if len(shape) != 2 or shape[1] != EMBEDDING_DIMENSION:
+            raise ValueError(
+                f"Embedding model must return {EMBEDDING_DIMENSION}-dimensional vectors; got {shape}"
+            )
+        return embeddings
+
+    def _upsert_chunks(self, chunks: list[DocumentChunk]) -> None:
         if not chunks:
             return
+        embeddings = self._encode([chunk.text for chunk in chunks])
 
-        texts = [c.text for c in chunks]
-        embeddings = self.dense_model.encode(texts, show_progress_bar=False)
-
-        # ---- Dense vectors ----
         if self.vector_db == "pinecone":
-            vectors = []
-            for idx, chunk in enumerate(chunks):
-                vectors.append(
-                    {
-                        "id": chunk.chunk_id,
-                        "values": embeddings[idx].tolist(),
-                        "metadata": chunk.model_dump(),
-                    }
-                )
-            # Upsert in batches of 100
-            for i in range(0, len(vectors), 100):
-                self.pinecone_index.upsert(vectors=vectors[i : i + 100])
-        else:
-            points = []
-            for idx, chunk in enumerate(chunks):
-                points.append(
-                    PointStruct(
-                        id=uuid.uuid5(uuid.NAMESPACE_DNS, chunk.chunk_id),
-                        vector=embeddings[idx].tolist(),
-                        payload=chunk.model_dump(),
-                    )
-                )
-            self.qdrant.upsert(collection_name=self.collection_name, points=points)
+            vectors = [
+                {
+                    "id": chunk.chunk_id,
+                    "values": embeddings[index].tolist(),
+                    "metadata": chunk.model_dump(),
+                }
+                for index, chunk in enumerate(chunks)
+            ]
+            for start in range(0, len(vectors), 100):
+                self.pinecone_index.upsert(vectors=vectors[start : start + 100])
+            return
 
-        # ---- Sparse BM25 ----
-        tokenized = [c.text.lower().split() for c in chunks]
-        self.bm25 = BM25Okapi(tokenized)
+        points = [
+            PointStruct(
+                id=uuid.uuid5(uuid.NAMESPACE_URL, chunk.chunk_id),
+                vector=embeddings[index].tolist(),
+                payload=chunk.model_dump(),
+            )
+            for index, chunk in enumerate(chunks)
+        ]
+        self.qdrant.upsert(collection_name=self.collection_name, points=points, wait=True)
 
-    def append_documents(self, chunks: List[DocumentChunk]) -> None:
-        """Add uploaded chunks while retaining documents already indexed."""
+    def _build_bm25(self) -> None:
+        tokenized = [_tokenize(chunk.text) for chunk in self.corpus_chunks]
+        self.bm25 = BM25Okapi(tokenized) if tokenized else None
+
+    def index_documents(self, chunks: Iterable[DocumentChunk]) -> None:
+        """Set the in-process corpus and upsert vectors into the configured store."""
+        new_chunks = list(chunks)
+        ids = [chunk.chunk_id for chunk in new_chunks]
+        if len(ids) != len(set(ids)):
+            raise ValueError("Document chunk IDs must be unique")
+        if any(
+            not chunk.chunk_id.strip() or not chunk.text.strip() or not _tokenize(chunk.text)
+            for chunk in new_chunks
+        ):
+            raise ValueError("Document chunks must have non-empty IDs and searchable text")
+
+        with self._corpus_lock:
+            if new_chunks:
+                self._upsert_chunks(new_chunks)
+            self.corpus_chunks = new_chunks
+            self.bm25 = None
+            if new_chunks:
+                self._build_bm25()
+
+    def restore_corpus(self, chunks: Iterable[DocumentChunk]) -> None:
+        """Restore sparse-retrieval data from disk without re-embedding vectors."""
+        restored = list(chunks)
+        ids = [chunk.chunk_id for chunk in restored]
+        if len(ids) != len(set(ids)):
+            raise ValueError("Document chunk IDs must be unique")
+        if any(
+            not chunk.chunk_id.strip() or not chunk.text.strip() or not _tokenize(chunk.text)
+            for chunk in restored
+        ):
+            raise ValueError("Document chunks must have non-empty IDs and searchable text")
+        with self._corpus_lock:
+            self.corpus_chunks = restored
+            self._build_bm25()
+
+    def has_vectors(self) -> bool:
+        """Return whether the configured vector collection/index contains points."""
+        if self.vector_db == "qdrant":
+            return self.qdrant.count(collection_name=self.collection_name, exact=True).count > 0
+        stats = self.pinecone_index.describe_index_stats()
+        total = getattr(stats, "total_vector_count", None)
+        if total is None and isinstance(stats, dict):
+            total = stats.get("total_vector_count", 0)
+        return bool(total)
+
+    def _delete_chunks(self, chunks: list[DocumentChunk]) -> None:
         if not chunks:
             return
-        existing_ids = {chunk.chunk_id for chunk in self.corpus_chunks}
-        new_chunks = [chunk for chunk in chunks if chunk.chunk_id not in existing_ids]
-        if new_chunks:
-            self.index_documents(self.corpus_chunks + new_chunks)
+        if self.vector_db == "pinecone":
+            ids = [chunk.chunk_id for chunk in chunks]
+            for start in range(0, len(ids), 1000):
+                self.pinecone_index.delete(ids=ids[start : start + 1000])
+            return
 
-    # ------------------------------------------------------------------
-    #   Retrieval
-    # ------------------------------------------------------------------
+        point_ids = [
+            uuid.uuid5(uuid.NAMESPACE_URL, chunk.chunk_id)
+            for chunk in chunks
+        ]
+        self.qdrant.delete(
+            collection_name=self.collection_name,
+            points_selector=PointIdsList(points=point_ids),
+            wait=True,
+        )
+
+    def replace_sources(self, chunks: Iterable[DocumentChunk]) -> list[DocumentChunk]:
+        """Replace uploaded source files by name, removing stale chunks on re-upload."""
+        incoming: list[DocumentChunk] = []
+        incoming_by_id: dict[str, DocumentChunk] = {}
+        for chunk in chunks:
+            if not chunk.chunk_id.strip() or not chunk.text.strip() or not _tokenize(chunk.text):
+                raise ValueError("Document chunks must have non-empty IDs and searchable text")
+            previous = incoming_by_id.get(chunk.chunk_id)
+            if previous and previous != chunk:
+                raise ValueError(f"Conflicting content for chunk ID {chunk.chunk_id!r}")
+            if previous is None:
+                incoming.append(chunk)
+                incoming_by_id[chunk.chunk_id] = chunk
+        if not incoming:
+            return []
+
+        def source_key(chunk: DocumentChunk) -> str:
+            return chunk.source_name or chunk.doc_id
+
+        incoming_sources = {source_key(chunk) for chunk in incoming}
+        with self._corpus_lock:
+            existing_by_source: dict[str, dict[str, DocumentChunk]] = {}
+            for chunk in self.corpus_chunks:
+                key = source_key(chunk)
+                if key in incoming_sources:
+                    existing_by_source.setdefault(key, {})[chunk.chunk_id] = chunk
+
+            incoming_by_source: dict[str, dict[str, DocumentChunk]] = {}
+            for chunk in incoming:
+                incoming_by_source.setdefault(source_key(chunk), {})[chunk.chunk_id] = chunk
+
+            changed_sources = {
+                key
+                for key in incoming_sources
+                if existing_by_source.get(key, {}) != incoming_by_source.get(key, {})
+            }
+            if not changed_sources:
+                return []
+
+            to_upsert = [chunk for chunk in incoming if source_key(chunk) in changed_sources]
+            new_ids = {chunk.chunk_id for chunk in to_upsert}
+            to_remove = [
+                chunk
+                for key in changed_sources
+                for chunk in existing_by_source.get(key, {}).values()
+                if chunk.chunk_id not in new_ids
+            ]
+            self._upsert_chunks(to_upsert)
+            self._delete_chunks(to_remove)
+            self.corpus_chunks = [
+                chunk for chunk in self.corpus_chunks if source_key(chunk) not in changed_sources
+            ] + to_upsert
+            self._build_bm25()
+            return to_upsert
+
+    def append_documents(self, chunks: Iterable[DocumentChunk]) -> list[DocumentChunk]:
+        """Upsert only new chunk IDs, then extend the sparse corpus."""
+        with self._corpus_lock:
+            existing_by_id = {chunk.chunk_id: chunk for chunk in self.corpus_chunks}
+            added: list[DocumentChunk] = []
+            seen = set(existing_by_id)
+            for chunk in chunks:
+                if not chunk.chunk_id.strip() or not chunk.text.strip() or not _tokenize(chunk.text):
+                    raise ValueError("Document chunks must have non-empty IDs and searchable text")
+                if chunk.chunk_id not in seen:
+                    added.append(chunk)
+                    seen.add(chunk.chunk_id)
+                    existing_by_id[chunk.chunk_id] = chunk
+                elif existing_by_id[chunk.chunk_id] != chunk:
+                    raise ValueError(f"Conflicting content for chunk ID {chunk.chunk_id!r}")
+            if not added:
+                return []
+
+            self._upsert_chunks(added)
+            self.corpus_chunks.extend(added)
+            self._build_bm25()
+            return added
+
+    def _dense_results(self, query: str, top_k: int) -> tuple[list[str], dict[str, DocumentChunk]]:
+        query_vector = self._encode([QUERY_INSTRUCTION + query])[0].tolist()
+        chunk_map: dict[str, DocumentChunk] = {}
+
+        if self.vector_db == "pinecone":
+            result = self.pinecone_index.query(
+                vector=query_vector,
+                top_k=top_k,
+                include_metadata=True,
+            )
+            matches = getattr(result, "matches", None)
+            if matches is None and isinstance(result, dict):
+                matches = result.get("matches", [])
+            chunk_ids = []
+            for match in matches or []:
+                metadata = getattr(match, "metadata", None)
+                match_id = getattr(match, "id", None)
+                if isinstance(match, dict):
+                    metadata = metadata or match.get("metadata")
+                    match_id = match_id or match.get("id")
+                metadata = metadata or {}
+                chunk_id = str(metadata.get("chunk_id") or match_id or "")
+                if not chunk_id:
+                    continue
+                chunk_ids.append(chunk_id)
+                if metadata.get("text"):
+                    page_number = metadata.get("page_number")
+                    chunk_map[chunk_id] = DocumentChunk(
+                        chunk_id=chunk_id,
+                        doc_id=str(metadata.get("doc_id", "document")),
+                        text=str(metadata["text"]),
+                        parent_text=str(metadata.get("parent_text") or metadata["text"]),
+                        source_name=metadata.get("source_name"),
+                        page_number=int(page_number) if page_number is not None else None,
+                    )
+            return chunk_ids, chunk_map
+
+        hits = self.qdrant.query_points(
+            collection_name=self.collection_name,
+            query=query_vector,
+            limit=top_k,
+            with_payload=True,
+        ).points
+        chunk_ids = []
+        for hit in hits:
+            payload = hit.payload or {}
+            chunk_id = str(payload.get("chunk_id", ""))
+            if not chunk_id:
+                continue
+            chunk_ids.append(chunk_id)
+            if payload.get("text"):
+                page_number = payload.get("page_number")
+                chunk_map[chunk_id] = DocumentChunk(
+                    chunk_id=chunk_id,
+                    doc_id=str(payload.get("doc_id", "document")),
+                    text=str(payload["text"]),
+                    parent_text=str(payload.get("parent_text") or payload["text"]),
+                    source_name=payload.get("source_name"),
+                    page_number=int(page_number) if page_number is not None else None,
+                )
+        return chunk_ids, chunk_map
+
     def hybrid_retrieve(
         self,
         query: str,
         top_candidates: int = 20,
         final_k: int = 5,
         mode: str = "hybrid_rerank",
-    ) -> List[DocumentChunk]:
-        """Retrieve chunks using one of the documented ablation configurations.
-
-        ``dense`` (C1), ``bm25`` (C2), ``hybrid`` (C3), and
-        ``hybrid_rerank`` (C4) are supported. The default retains the original
-        hybrid-plus-reranker behavior.
-        """
-        if mode not in {"dense", "bm25", "hybrid", "hybrid_rerank"}:
-            raise ValueError(
-                f"Unknown retrieval mode {mode!r}; expected dense, bm25, hybrid, or hybrid_rerank"
-            )
-        if top_candidates <= 0 or final_k <= 0:
+    ) -> list[DocumentChunk]:
+        """Retrieve using dense, BM25, RRF, or RRF with cross-encoder reranking."""
+        allowed_modes = {"dense", "bm25", "hybrid", "hybrid_rerank"}
+        if mode not in allowed_modes:
+            raise ValueError(f"Unknown retrieval mode {mode!r}; choose one of {sorted(allowed_modes)}")
+        if top_candidates <= 0 or final_k <= 0 or not query.strip():
             return []
 
-        dense_cids: List[str] = []
-        dense_chunk_map: Dict[str, DocumentChunk] = {}
+        with self._corpus_lock:
+            corpus_chunks = list(self.corpus_chunks)
+            bm25_index = self.bm25
 
-        # ---- Dense retrieval ----
+        dense_ids: list[str] = []
+        dense_chunk_map: dict[str, DocumentChunk] = {}
         if mode in {"dense", "hybrid", "hybrid_rerank"}:
-            query_vec = self.dense_model.encode(query).tolist()
-            if self.vector_db == "pinecone":
-                query_res = self.pinecone_index.query(
-                    vector=query_vec,
-                    top_k=top_candidates,
-                    include_metadata=True,
-                )
-                matches = getattr(query_res, "matches", None)
-                if matches is None and isinstance(query_res, dict):
-                    matches = query_res.get("matches", [])
+            dense_ids, dense_chunk_map = self._dense_results(query.strip(), top_candidates)
 
-                for match in matches or []:
-                    meta = (
-                        getattr(match, "metadata", None)
-                        or (match.get("metadata") if isinstance(match, dict) else {})
-                        or {}
-                    )
-                    match_id = getattr(match, "id", None) or (
-                        match.get("id") if isinstance(match, dict) else ""
-                    )
-                    cid = str(meta.get("chunk_id") or match_id)
-                    if cid:
-                        dense_cids.append(cid)
-                        if cid not in dense_chunk_map and "text" in meta:
-                            dense_chunk_map[cid] = DocumentChunk(
-                                chunk_id=cid,
-                                doc_id=meta.get("doc_id", "doc"),
-                                text=meta.get("text", ""),
-                                parent_text=meta.get("parent_text", meta.get("text", "")),
-                            )
-            else:
-                dense_hits = self.qdrant.query_points(
-                    collection_name=self.collection_name,
-                    query=query_vec,
-                    limit=top_candidates,
-                ).points
-                dense_cids = [str(hit.payload["chunk_id"]) for hit in dense_hits]
+        sparse_ids: list[str] = []
+        if mode in {"bm25", "hybrid", "hybrid_rerank"} and bm25_index and corpus_chunks:
+            scores = bm25_index.get_scores(_tokenize(query))
+            ranked_indices = sorted(range(len(scores)), key=lambda index: scores[index], reverse=True)
+            sparse_ids = [
+                corpus_chunks[index].chunk_id
+                for index in ranked_indices[:top_candidates]
+                if _tokenize(corpus_chunks[index].text)
+            ]
 
-        # ---- Sparse BM25 retrieval ----
-        sparse_cids: List[str] = []
-        if mode in {"bm25", "hybrid", "hybrid_rerank"} and self.bm25 is not None and self.corpus_chunks:
-            tokenized_q = query.lower().split()
-            bm25_scores = self.bm25.get_scores(tokenized_q)  # type: ignore[arg-type]
-            sparse_idx = sorted(
-                range(len(bm25_scores)), key=lambda i: bm25_scores[i], reverse=True
-            )[:top_candidates]
-            sparse_cids = [self.corpus_chunks[idx].chunk_id for idx in sparse_idx]
-
-        # ---- Select a ranked candidate pool ----
         if mode == "dense":
-            fused_ids = dense_cids[:top_candidates]
+            candidate_ids = dense_ids[:top_candidates]
         elif mode == "bm25":
-            fused_ids = sparse_cids[:top_candidates]
+            candidate_ids = sparse_ids[:top_candidates]
         else:
-            k_smooth = 60
-            rrf: Dict[str, float] = {}
-            for rank, cid in enumerate(dense_cids, start=1):
-                rrf[cid] = rrf.get(cid, 0.0) + 1.0 / (k_smooth + rank)
-            for rank, cid in enumerate(sparse_cids, start=1):
-                rrf[cid] = rrf.get(cid, 0.0) + 1.0 / (k_smooth + rank)
-            fused_ids = sorted(rrf, key=rrf.get, reverse=True)[:top_candidates]
+            rrf_scores: dict[str, float] = {}
+            for ranking in (dense_ids, sparse_ids):
+                for rank, chunk_id in enumerate(ranking, start=1):
+                    rrf_scores[chunk_id] = rrf_scores.get(chunk_id, 0.0) + 1.0 / (60 + rank)
+            candidate_ids = sorted(rrf_scores, key=rrf_scores.get, reverse=True)[:top_candidates]
 
-        id_to_chunk = {c.chunk_id: c for c in self.corpus_chunks}
-        # Fall back to metadata received from Pinecone if not in local corpus_chunks
+        id_to_chunk = {chunk.chunk_id: chunk for chunk in corpus_chunks}
         id_to_chunk.update(dense_chunk_map)
-
-        candidates = [id_to_chunk[cid] for cid in fused_ids if cid in id_to_chunk]
+        candidates = [id_to_chunk[chunk_id] for chunk_id in candidate_ids if chunk_id in id_to_chunk]
         if not candidates:
             return []
-
-        candidates = candidates[:top_candidates]
         if mode != "hybrid_rerank":
             return candidates[:final_k]
 
-        # ---- Cross-Encoder reranking ----
-        pairs = [[query, c.text] for c in candidates]
-        cross_scores = self.reranker.predict(pairs)
-        rerank_idx = sorted(
-            range(len(cross_scores)), key=lambda i: cross_scores[i], reverse=True
-        )[:final_k]
-
-        return [candidates[i] for i in rerank_idx]
+        scores = self.reranker.predict([[query, chunk.text] for chunk in candidates])
+        reranked = sorted(range(len(candidates)), key=lambda index: float(scores[index]), reverse=True)
+        return [candidates[index] for index in reranked[:final_k]]
 
     def retrieve(
         self,
@@ -294,14 +460,6 @@ class ProductionHybridRAG:
         mode: str = "hybrid_rerank",
         k: int = 5,
         top_candidates: int = 20,
-    ) -> List[DocumentChunk]:
-        """Stable public entry point used by the evaluation harness."""
-        return self.hybrid_retrieve(
-            query,
-            top_candidates=top_candidates,
-            final_k=k,
-            mode=mode,
-        )
-
-
-"""End of ProductionHybridRAG implementation."""
+    ) -> list[DocumentChunk]:
+        """Stable public method used by the evaluation harness."""
+        return self.hybrid_retrieve(query, top_candidates=top_candidates, final_k=k, mode=mode)
