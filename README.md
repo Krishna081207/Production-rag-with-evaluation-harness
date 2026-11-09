@@ -37,15 +37,13 @@ Copy-Item .env.example .env
 
 Edit `.env` and set a long random `ADMIN_API_KEY` to enable uploads. Set `GROQ_API_KEY` for generated answers; without it, the application returns a cited extractive answer. The default local setup uses Qdrant at `rag_hybrid/data/qdrant` and saves the sparse corpus under `rag_hybrid/data/`.
 
-Start the API and UI in separate terminals:
+For local testing, start both services from one terminal:
 
 ```powershell
-python -m uvicorn rag_hybrid.src.api.app:app --reload
+python -m rag_hybrid.scripts.run_local
 ```
 
-```powershell
-streamlit run rag_hybrid/scripts/app_streamlit.py
-```
+The launcher waits for FastAPI readiness before starting Streamlit and prints startup errors in the same terminal. Open <http://127.0.0.1:8501>. Press Ctrl+C to stop both services. To run them separately instead, start FastAPI with `python -m uvicorn rag_hybrid.src.api.app:app --reload` and Streamlit with `python -m streamlit run rag_hybrid/scripts/app_streamlit.py` in separate terminals.
 
 Open <http://localhost:8501>, upload a paper, and ask a question such as:
 

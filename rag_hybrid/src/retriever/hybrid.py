@@ -1,17 +1,27 @@
 """Hybrid dense and BM25 retrieval with RRF fusion and cross-encoder reranking."""
 
+from __future__ import annotations
+
 import os
 import re
 import threading
 import uuid
 from collections.abc import Iterable
+from typing import TYPE_CHECKING, Any
 
 from dotenv import load_dotenv
 from pydantic import BaseModel, ConfigDict, Field
 from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, PointIdsList, PointStruct, VectorParams
 from rank_bm25 import BM25Okapi
-from sentence_transformers import CrossEncoder, SentenceTransformer
+
+if TYPE_CHECKING:
+    from sentence_transformers import CrossEncoder as CrossEncoderType
+    from sentence_transformers import SentenceTransformer as SentenceTransformerType
+
+# Kept as patchable sentinels so imports stay light until a model is first used.
+CrossEncoder: Any = None
+SentenceTransformer: Any = None
 
 load_dotenv()
 
@@ -69,8 +79,8 @@ class ProductionHybridRAG:
         )
         self.embedding_model_name = embedding_model or EMBEDDING_MODEL
         self.reranker_model_name = reranker_model or RERANKER_MODEL
-        self._dense_model: SentenceTransformer | None = None
-        self._reranker: CrossEncoder | None = None
+        self._dense_model: SentenceTransformerType | None = None
+        self._reranker: CrossEncoderType | None = None
         self.bm25: BM25Okapi | None = None
         self.corpus_chunks: list[DocumentChunk] = []
         self._corpus_lock = threading.RLock()
@@ -91,13 +101,21 @@ class ProductionHybridRAG:
     @property
     def dense_model(self) -> SentenceTransformer:
         if self._dense_model is None:
-            self._dense_model = SentenceTransformer(self.embedding_model_name)
+            model_class = SentenceTransformer
+            if model_class is None:
+                from sentence_transformers import SentenceTransformer as model_class
+
+            self._dense_model = model_class(self.embedding_model_name)
         return self._dense_model
 
     @property
     def reranker(self) -> CrossEncoder:
         if self._reranker is None:
-            self._reranker = CrossEncoder(self.reranker_model_name)
+            model_class = CrossEncoder
+            if model_class is None:
+                from sentence_transformers import CrossEncoder as model_class
+
+            self._reranker = model_class(self.reranker_model_name)
         return self._reranker
 
     def _initialize_qdrant(self, qdrant_url: str | None, qdrant_path: str | None) -> None:

@@ -1,10 +1,18 @@
 """NLI-based verification of generated claims against cited retrieved evidence."""
 
+from __future__ import annotations
+
 import logging
 from collections.abc import Mapping
+from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel
-from sentence_transformers import CrossEncoder
+
+if TYPE_CHECKING:
+    from sentence_transformers import CrossEncoder as CrossEncoderType
+
+# Keep the module importable without loading PyTorch until scoring is requested.
+CrossEncoder: Any = None
 
 logger = logging.getLogger(__name__)
 
@@ -20,7 +28,11 @@ class FaithfulnessEvaluator:
     """Estimate support for each claim from its cited chunk's parent context."""
 
     def __init__(self, model_name: str = "cross-encoder/nli-deberta-v3-small"):
-        self.nli = CrossEncoder(model_name)
+        model_class = CrossEncoder
+        if model_class is None:
+            from sentence_transformers import CrossEncoder as model_class
+
+        self.nli: CrossEncoderType = model_class(model_name)
         config = getattr(getattr(self.nli, "model", None), "config", None)
         label2id = getattr(config, "label2id", {}) or {}
         self.entail_idx = int(label2id.get("entailment", 1))
