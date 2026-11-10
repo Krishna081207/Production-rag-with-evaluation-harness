@@ -123,10 +123,27 @@ def upload_documents(base_url: str, files: list) -> dict[str, Any]:
 
 @st.cache_resource(show_spinner="Loading local models…")
 def _load_inline_pipeline():
+<<<<<<< Updated upstream
     """Load a small, temporary in-memory RAG demo for offline use."""
     from rag_hybrid.src.eval.faithfulness import FaithfulnessEvaluator
     from rag_hybrid.src.generator.generator import extract_claims, generate_answer
     from rag_hybrid.src.retriever.hybrid import DocumentChunk, ProductionHybridRAG
+=======
+    """Load the RAG components once and cache them."""
+    import re
+
+    # Resolve this optional evaluator dynamically so static analyzers do not
+    # require the runtime package root to be on their import path.
+    from importlib import import_module
+
+    FaithfulnessEvaluator = import_module(
+        "rag_hybrid.src.eval.faithfulness"
+    ).FaithfulnessEvaluator
+    generate_answer = import_module("rag_hybrid.src.generator.generator").generate_answer
+    retriever = import_module("rag_hybrid.src.retriever.hybrid")
+    DocumentChunk = retriever.DocumentChunk
+    ProductionHybridRAG = retriever.ProductionHybridRAG
+>>>>>>> Stashed changes
 
     rag = ProductionHybridRAG(vector_db="qdrant", qdrant_path=":memory:")
     evaluator = (
@@ -212,7 +229,11 @@ def call_inline(query: str, top_k: int) -> dict[str, Any]:
 
 def index_inline_documents(files: list) -> dict[str, Any]:
     """Parse and index selected documents in the cached inline pipeline."""
-    from rag_hybrid.src.ingestion import chunk_document_segments, read_document_segments
+    from importlib import import_module
+
+    ingestion = import_module("rag_hybrid.src.ingestion")
+    chunk_document_segments = ingestion.chunk_document_segments
+    read_document_segments = ingestion.read_document_segments
 
     rag, _, _, _ = _load_inline_pipeline()
     st.session_state.inline_pipeline_loaded = True
