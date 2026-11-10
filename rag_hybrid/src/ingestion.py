@@ -58,6 +58,11 @@ def read_document_segments(filename: str, content: bytes) -> tuple[str, list[tup
 
     segments = [(page, text.strip()) for page, text in segments if text.strip()]
     if not segments:
+        if suffix == ".pdf":
+            raise ValueError(
+                "No selectable text was found in the PDF. It may be a scanned document; "
+                "run OCR on it and upload the searchable PDF again."
+            )
         raise ValueError("No readable text was found in the document")
     return "\n".join(text for _, text in segments), segments
 

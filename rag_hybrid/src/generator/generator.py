@@ -17,6 +17,13 @@ logger = logging.getLogger(__name__)
 
 ABSTENTION = "The provided documentation does not contain sufficient evidence to answer this inquiry."
 CITATION_RE = re.compile(r"\[Chunk_([^\]]+)\]")
+_CITATION_SUFFIX_RE = re.compile(r"([.!?])\s*((?:\[Chunk_[^\]]+\]\s*)+)")
+_WORD_RE = re.compile(r"[\w]+", flags=re.UNICODE)
+_STOP_WORDS = {
+    "a", "an", "and", "are", "as", "at", "be", "by", "does", "for", "from",
+    "how", "in", "is", "it", "of", "on", "or", "that", "the", "to", "what",
+    "when", "where", "which", "who", "why", "with",
+}
 
 
 class GenerationResult(BaseModel):
@@ -25,24 +32,99 @@ class GenerationResult(BaseModel):
 
 
 def _sentences(text: str) -> list[str]:
+    text = _move_trailing_citations_before_punctuation(text)
     return [part.strip() for part in re.split(r"(?<=[.!?])\s+", text.strip()) if part.strip()]
 
 
-def _extractive_fallback(retrieved_chunks: list[DocumentChunk]) -> GenerationResult:
-    """Return the first sentence from the best retrieved parent, with its source."""
+def _move_trailing_citations_before_punctuation(text: str) -> str:
+    """Keep a citation attached to its claim when it follows sentence punctuation."""
+
+    def move_citations(match: re.Match[str]) -> str:
+        citations = " ".join(f"[Chunk_{chunk_id}]" for chunk_id in CITATION_RE.findall(match.group(2)))
+        return f" {citations}{match.group(1)}"
+
+    return _CITATION_SUFFIX_RE.sub(move_citations, text)
+
+
+def _query_terms(query: str) -> list[str]:
+    return [
+        token.lower()
+        for token in _WORD_RE.findall(query)
+        if len(token) > 2 and token.lower() not in _STOP_WORDS
+    ]
+
+
+def _term_key(term: str) -> str:
+    """Match common inflections such as evaluation/evaluating in the fallback."""
+    return term[:6] if len(term) > 6 else term
+
+
+def _sentence_query_score(sentence: str, terms: list[str]) -> int:
+    sentence_terms = {token.lower() for token in _WORD_RE.findall(sentence)}
+    sentence_keys = {_term_key(token) for token in sentence_terms}
+    return sum(
+        1
+        for term in terms
+        if term in sentence_terms or _term_key(term) in sentence_keys
+    )
+
+
+def _format_cited_sentence(sentence: str, chunk_id: str) -> str:
+    sentence = CITATION_RE.sub("", sentence).strip()
+    punctuation = sentence[-1] if sentence and sentence[-1] in ".!?" else "."
+    body = sentence[:-1].rstrip() if sentence.endswith(punctuation) else sentence
+    return f"{body} [Chunk_{chunk_id}]{punctuation}"
+
+
+def _extractive_fallback(
+    retrieved_chunks: list[DocumentChunk], query: str = ""
+) -> GenerationResult:
+    """Return a query-relevant sentence from the best retrieved child chunk."""
     if not retrieved_chunks:
         return GenerationResult(answer=ABSTENTION, citations=[])
 
-    chunk = retrieved_chunks[0]
-    text = " ".join(chunk.parent_text.split())
-    sentence = _sentences(text)[0] if text else ""
-    sentence = CITATION_RE.sub("", sentence).strip()
-    if not sentence:
+    terms = _query_terms(query)
+    candidates: list[tuple[int, int, int, str, DocumentChunk]] = []
+    for rank, chunk in enumerate(retrieved_chunks):
+        # Child text avoids unrelated neighboring passages and page headers that
+        # are included at the start of the larger parent context.
+        text = re.sub(r"(?<=\w)-\s+(?=\w)", "", " ".join(chunk.text.split()))
+        for sentence_index, sentence in enumerate(_sentences(text)):
+            sentence = CITATION_RE.sub("", sentence).strip()
+            if len(_WORD_RE.findall(sentence)) < 4:
+                continue
+            score = _sentence_query_score(sentence, terms)
+            candidates.append((score, -rank, -sentence_index, sentence, chunk))
+
+    if not candidates:
         return GenerationResult(answer=ABSTENTION, citations=[])
-    if sentence[-1] not in ".!?":
-        sentence += "."
+
+    _, _, _, sentence, chunk = max(candidates, key=lambda item: item[:3])
+    answer = _format_cited_sentence(sentence, chunk.chunk_id)
     citation = f"Chunk_{chunk.chunk_id}"
-    return GenerationResult(answer=f"{sentence} [{citation}]", citations=[citation])
+    return GenerationResult(answer=answer, citations=[citation])
+
+
+def extract_claims(answer: str) -> list[dict[str, str]]:
+    """Split an answer into factual claims and attach nearby source IDs."""
+    if _is_abstention(answer):
+        return []
+
+    claims: list[dict[str, str]] = []
+    for sentence in _sentences(answer):
+        cited_ids = CITATION_RE.findall(sentence)
+        claim = CITATION_RE.sub("", sentence).strip()
+        claim = re.sub(r"\s+([.!?])", r"\1", claim)
+        if not claim:
+            continue
+        if cited_ids:
+            claims.extend(
+                {"claim": claim, "citation": f"Chunk_{chunk_id}"}
+                for chunk_id in cited_ids
+            )
+        else:
+            claims.append({"claim": claim, "citation": ""})
+    return claims
 
 
 def _build_prompt(query: str, chunks: list[DocumentChunk]) -> str:
@@ -99,7 +181,7 @@ def generate_answer(query: str, retrieved_chunks: list[DocumentChunk]) -> Genera
 
     api_key = os.getenv("GROQ_API_KEY") or os.getenv("groq")
     if not api_key:
-        return _extractive_fallback(retrieved_chunks)
+        return _extractive_fallback(retrieved_chunks, query)
 
     try:
         client = Groq(api_key=api_key)
@@ -112,12 +194,12 @@ def generate_answer(query: str, retrieved_chunks: list[DocumentChunk]) -> Genera
         answer_text = (response.choices[0].message.content or "").strip()
     except Exception as exc:
         logger.warning("Groq generation failed; using cited extractive fallback: %s", exc)
-        return _extractive_fallback(retrieved_chunks)
+        return _extractive_fallback(retrieved_chunks, query)
 
     valid_ids = {f"Chunk_{chunk.chunk_id}" for chunk in retrieved_chunks}
     if not _has_only_valid_citations(answer_text, valid_ids):
         logger.warning("Generated answer had missing or invalid citations; using extractive fallback")
-        return _extractive_fallback(retrieved_chunks)
+        return _extractive_fallback(retrieved_chunks, query)
 
     citations = list(dict.fromkeys(f"Chunk_{value}" for value in CITATION_RE.findall(answer_text)))
     return GenerationResult(answer=answer_text or ABSTENTION, citations=citations)

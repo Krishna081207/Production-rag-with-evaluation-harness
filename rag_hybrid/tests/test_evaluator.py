@@ -72,7 +72,9 @@ class TestVerifiedClaims:
 
     def test_all_claims_verified(self, mock_evaluator, sample_map):
         evaluator, nli = mock_evaluator
-        nli.predict.return_value = np.array([[0.0, 0.90, 0.1]])
+        nli.predict.return_value = np.array(
+            [[0.0, 0.90, 0.1], [0.0, 0.90, 0.1]]
+        )
         claims = [
             {"claim": "Python is a programming language.", "citation": "c1"},
             {"claim": "FastAPI is a web framework.", "citation": "c2"},
@@ -80,6 +82,37 @@ class TestVerifiedClaims:
         result = evaluator.evaluate_generation(claims, sample_map)
         assert result.faithfulness_score == 1.0
         assert len(result.violations) == 0
+
+    def test_claim_is_checked_against_individual_evidence_sentences(
+        self, mock_evaluator, sample_map
+    ):
+        evaluator, nli = mock_evaluator
+        supported_sentence = "A study uses RAGAS to evaluate faithfulness."
+        evidence = (
+            "This paragraph contains unrelated background information. "
+            f"{supported_sentence} "
+            "It then discusses a separate limitation."
+        )
+
+        def score_windows(pairs, apply_softmax=True):
+            return np.array(
+                [
+                    [0.01, 0.99, 0.0]
+                    if premise == supported_sentence
+                    else [0.01, 0.01, 0.98]
+                    for premise, _claim in pairs
+                ]
+            )
+
+        nli.predict.side_effect = score_windows
+        claims = [
+            {"claim": supported_sentence, "citation": "Chunk_c1"}
+        ]
+
+        result = evaluator.evaluate_generation(claims, {"c1": evidence})
+
+        assert result.verified_claims == 1
+        assert result.faithfulness_score == 1.0
 
 
 # ---------------------------------------------------------------------------

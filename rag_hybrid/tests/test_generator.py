@@ -13,6 +13,7 @@ import pytest
 from rag_hybrid.src.generator.generator import (
     GenerationResult,
     _build_prompt,
+    extract_claims,
     generate_answer,
 )
 from rag_hybrid.src.retriever.hybrid import DocumentChunk
@@ -83,6 +84,42 @@ class TestGenerateAnswerNoChunks:
         assert isinstance(result, GenerationResult)
         assert "does not contain" in result.answer.lower() or "insufficient" in result.answer.lower() or result.answer != ""
         assert result.citations == []
+
+    def test_fallback_uses_query_relevant_child_sentence_and_attaches_citation(self, monkeypatch):
+        monkeypatch.delenv("GROQ_API_KEY", raising=False)
+        monkeypatch.delenv("groq", raising=False)
+        chunk = DocumentChunk(
+            chunk_id="c2",
+            doc_id="paper",
+            text=(
+                "retrieval costs and accu- racy. This approach enables evaluating RAG systems "
+                "across a spectrum of cost constraints rather than at fixed operating points."
+            ),
+            parent_text=(
+                "10 Front. Comput. Sci., 2025, 0(0): 1–18 Table 1. "
+                "retrieval costs and accuracy. This approach enables evaluating RAG systems "
+                "across a spectrum of cost constraints rather than at fixed operating points."
+            ),
+        )
+
+        result = generate_answer("rag evaluation ways", [chunk])
+
+        assert result.answer.startswith("This approach enables evaluating RAG systems")
+        assert result.answer.endswith("[Chunk_c2].")
+        assert extract_claims(result.answer) == [
+            {
+                "claim": (
+                    "This approach enables evaluating RAG systems across a spectrum of "
+                    "cost constraints rather than at fixed operating points."
+                ),
+                "citation": "Chunk_c2",
+            }
+        ]
+
+    def test_claim_parser_keeps_citation_after_period_with_its_claim(self):
+        assert extract_claims("The paper reports an improvement. [Chunk_c1]") == [
+            {"claim": "The paper reports an improvement.", "citation": "Chunk_c1"}
+        ]
 
 
 class TestGenerateAnswerWithMockedGroq:

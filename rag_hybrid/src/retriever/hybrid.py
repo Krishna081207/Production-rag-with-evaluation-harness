@@ -81,6 +81,7 @@ class ProductionHybridRAG:
         self.reranker_model_name = reranker_model or RERANKER_MODEL
         self._dense_model: SentenceTransformerType | None = None
         self._reranker: CrossEncoderType | None = None
+        self._model_lock = threading.RLock()
         self.bm25: BM25Okapi | None = None
         self.corpus_chunks: list[DocumentChunk] = []
         self._corpus_lock = threading.RLock()
@@ -100,23 +101,25 @@ class ProductionHybridRAG:
 
     @property
     def dense_model(self) -> SentenceTransformer:
-        if self._dense_model is None:
-            model_class = SentenceTransformer
-            if model_class is None:
-                from sentence_transformers import SentenceTransformer as model_class
+        with self._model_lock:
+            if self._dense_model is None:
+                model_class = SentenceTransformer
+                if model_class is None:
+                    from sentence_transformers import SentenceTransformer as model_class
 
-            self._dense_model = model_class(self.embedding_model_name)
-        return self._dense_model
+                self._dense_model = model_class(self.embedding_model_name)
+            return self._dense_model
 
     @property
     def reranker(self) -> CrossEncoder:
-        if self._reranker is None:
-            model_class = CrossEncoder
-            if model_class is None:
-                from sentence_transformers import CrossEncoder as model_class
+        with self._model_lock:
+            if self._reranker is None:
+                model_class = CrossEncoder
+                if model_class is None:
+                    from sentence_transformers import CrossEncoder as model_class
 
-            self._reranker = model_class(self.reranker_model_name)
-        return self._reranker
+                self._reranker = model_class(self.reranker_model_name)
+            return self._reranker
 
     def _initialize_qdrant(self, qdrant_url: str | None, qdrant_path: str | None) -> None:
         resolved_url = qdrant_url or os.getenv("QDRANT_URL")

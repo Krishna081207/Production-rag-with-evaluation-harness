@@ -1,8 +1,6 @@
-"""Streamlit front-end for research paper understanding.
+"""Chat-style Streamlit front end for the research paper assistant."""
 
-API mode calls the FastAPI backend at ``RAG_API_URL``. Inline mode runs a
-temporary, in-memory demo pipeline in this process.
-"""
+from __future__ import annotations
 
 import os
 import time
@@ -13,11 +11,8 @@ import streamlit as st
 from dotenv import load_dotenv
 
 load_dotenv()
-API_START_COMMAND = "python -m uvicorn rag_hybrid.src.api.app:app --reload"
+API_START_COMMAND = "python -m rag_hybrid.scripts.run_local"
 
-# ---------------------------------------------------------------------------
-# Page config
-# ---------------------------------------------------------------------------
 st.set_page_config(
     page_title="Research Paper Assistant",
     page_icon="📄",
@@ -25,231 +20,97 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# ---------------------------------------------------------------------------
-# Custom CSS for a polished look
-# ---------------------------------------------------------------------------
 st.markdown(
     """
     <style>
-    html, body, [class*="css"] {
-        font-family: Inter, system-ui, sans-serif;
-    }
-
-    /* Dark gradient background */
-    .stApp {
-        background: linear-gradient(135deg, #0f0c29, #302b63, #24243e);
-        color: #e2e8f0;
-    }
-
-    /* Hero card */
+    html, body, [class*="css"] { font-family: Inter, system-ui, sans-serif; }
+    .stApp { background: linear-gradient(135deg, #0f0c29, #302b63, #24243e); color: #e2e8f0; }
+    section[data-testid="stSidebar"] { background: rgba(0,0,0,0.35); }
+    [data-testid="stChatMessage"] { background: rgba(255,255,255,0.045); border: 1px solid rgba(255,255,255,0.08); }
     .hero-card {
-        background: rgba(255,255,255,0.06);
-        border: 1px solid rgba(255,255,255,0.12);
-        border-radius: 18px;
-        padding: 2rem 2.5rem;
-        margin-bottom: 1.5rem;
+        background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.12);
+        border-radius: 18px; padding: 1.5rem 2rem; margin: 0.5rem 0 1.5rem;
         backdrop-filter: blur(12px);
     }
-
-    /* Answer box */
-    .answer-box {
-        background: rgba(99, 102, 241, 0.12);
-        border-left: 4px solid #6366f1;
-        border-radius: 12px;
-        padding: 1.25rem 1.5rem;
-        margin: 1rem 0;
-        line-height: 1.75;
-    }
-
-    /* Metric card */
     .metric-card {
-        background: rgba(255,255,255,0.05);
-        border: 1px solid rgba(255,255,255,0.1);
-        border-radius: 14px;
-        padding: 1rem 1.25rem;
-        text-align: center;
+        background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.1);
+        border-radius: 12px; padding: 0.8rem 1rem; text-align: center;
     }
-
-    /* Citation chip */
-    .chip {
-        display: inline-block;
-        background: rgba(99,102,241,0.25);
-        border: 1px solid rgba(99,102,241,0.5);
-        border-radius: 999px;
-        padding: 2px 12px;
-        font-size: 0.78rem;
-        margin: 2px 4px;
-        color: #c7d2fe;
-    }
-
-    /* Violation warning */
-    .violation {
-        background: rgba(239,68,68,0.12);
-        border-left: 4px solid #ef4444;
-        border-radius: 10px;
-        padding: 0.75rem 1rem;
-        margin: 0.5rem 0;
-        font-size: 0.88rem;
-        color: #fca5a5;
-    }
-
-    /* Sidebar */
-    section[data-testid="stSidebar"] {
-        background: rgba(0,0,0,0.35);
-    }
-
-    /* Buttons */
     .stButton > button {
-        background: linear-gradient(90deg, #6366f1, #8b5cf6);
-        color: white;
-        border: none;
-        border-radius: 10px;
-        padding: 0.55rem 1.6rem;
-        font-weight: 600;
-        transition: opacity 0.2s;
+        background: linear-gradient(90deg, #6366f1, #8b5cf6); color: white;
+        border: none; border-radius: 10px; font-weight: 600;
     }
-    .stButton > button:hover { opacity: 0.85; }
-
-    .stTextInput > div > input {
-        background: rgba(255,255,255,0.07);
-        border: 1px solid rgba(255,255,255,0.18);
-        border-radius: 10px;
-        color: #e2e8f0;
-    }
-
     .stSpinner > div { color: #6366f1 !important; }
     </style>
     """,
     unsafe_allow_html=True,
 )
 
-# ---------------------------------------------------------------------------
-# Sidebar – configuration
-# ---------------------------------------------------------------------------
-#upload documents
-st.markdown("## 📄 Upload research sources")
-stfile = st.file_uploader(
-    "Upload papers or supporting documents",
-    type=["pdf", "txt", "md", "docx"],
-    accept_multiple_files=True,
-)
-index_uploads = st.button(
-    "Index uploaded documents",
-    disabled=not stfile,
-    help="Parse, chunk, embed, and store the selected documents for search.",
-)
-with st.sidebar:
-    st.markdown("## ⚙️ Settings")
 
-    api_url = st.text_input(
-        "API base URL",
-        value=os.getenv("RAG_API_URL", "http://localhost:8000"),
-        help="URL of the running FastAPI backend",
-    )
+def _raise_for_api_error(response: requests.Response) -> None:
+    try:
+        response.raise_for_status()
+    except requests.HTTPError as exc:
+        try:
+            detail = response.json().get("detail")
+        except (ValueError, AttributeError):
+            detail = response.text.strip()
+        raise RuntimeError(detail or str(exc)) from exc
 
-    top_k = st.slider("Retrieved chunks (top-k)", min_value=1, max_value=10, value=5)
-    show_violations = st.checkbox("Show citation violations", value=True)
-    st.divider()
 
-    st.markdown("### 🧪 Mode")
-    mode = st.radio(
-        "Backend",
-        ["API (FastAPI)", "Inline (no server)"],
-        index=0,
-        help="Inline mode uses an in-memory demo corpus; uploaded papers are temporary. Use API mode for persistent storage.",
-    )
-
-    st.divider()
-    st.markdown(
-        "<small style='color:#94a3b8;'>Research Paper Assistant · Hybrid Dense+BM25+RRF · "
-        "Cross-Encoder reranker · NLI faithfulness</small>",
-        unsafe_allow_html=True,
-    )
-
-# ---------------------------------------------------------------------------
-# Hero header
-# ---------------------------------------------------------------------------
-st.markdown(
-    """
-    <div class="hero-card">
-        <h1 style="margin:0;font-size:2rem;background:linear-gradient(90deg,#a5b4fc,#c4b5fd);
-            -webkit-background-clip:text;-webkit-text-fill-color:transparent;">
-            📄 Research Paper Assistant
-        </h1>
-        <p style="color:#94a3b8;margin-top:0.5rem;">
-            Ask about a paper’s research question, contributions, methods, results, and limitations.
-            Answers link back to retrieved source chunks and PDF pages.
-        </p>
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
-
-# ---------------------------------------------------------------------------
-# Query history (session state)
-# ---------------------------------------------------------------------------
-if "history" not in st.session_state:
-    st.session_state.history = []
-
-# ---------------------------------------------------------------------------
-# Main query input
-# ---------------------------------------------------------------------------
-col_input, col_btn = st.columns([5, 1])
-with col_input:
-    query = st.text_input(
-        "Your question",
-        placeholder="e.g. What are the paper’s key findings?",
-        label_visibility="collapsed",
-    )
-with col_btn:
-    submit = st.button("Ask →", use_container_width=True)
-
-# ---------------------------------------------------------------------------
-# Helper: call FastAPI backend
-# ---------------------------------------------------------------------------
-
-def call_api(q: str) -> dict:
-    """POST to /query endpoint and return the JSON response."""
-    resp = requests.post(
-        f"{api_url.rstrip('/')}/query",
-        json={"query": q},
+def call_api(base_url: str, query: str, top_k: int) -> dict[str, Any]:
+    response = requests.post(
+        f"{base_url.rstrip('/')}/query",
+        json={"query": query, "top_k": top_k},
         timeout=180,
     )
-    resp.raise_for_status()
-    return resp.json()
+    _raise_for_api_error(response)
+    return response.json()
 
 
-def upload_documents(files: list) -> dict:
-    """Send selected files to the API ingestion pipeline."""
+def call_web_search(base_url: str, query: str) -> dict[str, Any]:
+    response = requests.post(
+        f"{base_url.rstrip('/')}/web-search",
+        json={"query": query},
+        timeout=30,
+    )
+    _raise_for_api_error(response)
+    return response.json()
+
+
+def call_readiness(base_url: str) -> dict[str, Any] | None:
+    try:
+        response = requests.get(f"{base_url.rstrip('/')}/ready", timeout=3)
+        _raise_for_api_error(response)
+        return response.json()
+    except (requests.RequestException, RuntimeError, ValueError):
+        return None
+
+
+def upload_documents(base_url: str, files: list) -> dict[str, Any]:
     payload = [
         ("files", (file.name, file.getvalue(), file.type or "application/octet-stream"))
         for file in files
     ]
-    resp = requests.post(
-        f"{api_url.rstrip('/')}/documents",
+    response = requests.post(
+        f"{base_url.rstrip('/')}/documents",
         files=payload,
         headers={"X-Admin-Key": os.getenv("ADMIN_API_KEY", "")},
         timeout=180,
     )
-    resp.raise_for_status()
-    return resp.json()
+    _raise_for_api_error(response)
+    return response.json()
 
-# ---------------------------------------------------------------------------
-# Helper: inline pipeline (no server required)
-# ---------------------------------------------------------------------------
-@st.cache_resource(show_spinner="Loading models…")
+
+@st.cache_resource(show_spinner="Loading local models…")
 def _load_inline_pipeline():
-    """Load the RAG components once and cache them."""
-    import re
-
+    """Load a small, temporary in-memory RAG demo for offline use."""
     from rag_hybrid.src.eval.faithfulness import FaithfulnessEvaluator
-    from rag_hybrid.src.generator.generator import generate_answer
+    from rag_hybrid.src.generator.generator import extract_claims, generate_answer
     from rag_hybrid.src.retriever.hybrid import DocumentChunk, ProductionHybridRAG
 
     rag = ProductionHybridRAG(vector_db="qdrant", qdrant_path=":memory:")
     evaluator = FaithfulnessEvaluator()
-
-    # Seed a tiny demo corpus so the UI works out of the box
     demo_chunks = [
         DocumentChunk(
             chunk_id="demo_retrieval_p1_c0",
@@ -257,7 +118,7 @@ def _load_inline_pipeline():
             source_name="synthetic_demo_paper.pdf",
             page_number=1,
             text="Research question: Does combining dense semantic retrieval and BM25 improve evidence retrieval for a research assistant?",
-            parent_text="Research question: Does combining dense semantic retrieval and BM25 improve evidence retrieval for a research assistant? The synthetic demonstration compares each method on a small illustrative corpus.",
+            parent_text="Research question: Does combining dense semantic retrieval and BM25 improve evidence retrieval for a research assistant? The synthetic demonstration compares retrieval methods.",
         ),
         DocumentChunk(
             chunk_id="demo_retrieval_p2_c0",
@@ -277,49 +138,37 @@ def _load_inline_pipeline():
         ),
     ]
     rag.index_documents(demo_chunks)
-    return rag, evaluator, generate_answer, re
+    return rag, evaluator, generate_answer, extract_claims
 
 
-def call_inline(q: str) -> dict:
-    rag, evaluator, generate_answer, _re = _load_inline_pipeline()
-    retrieved = rag.hybrid_retrieve(q, top_candidates=10, final_k=top_k)
-    gen_res = generate_answer(q, retrieved)
+def call_inline(query: str, top_k: int) -> dict[str, Any]:
+    rag, evaluator, generate_answer, extract_claims = _load_inline_pipeline()
+    retrieved = rag.hybrid_retrieve(query, top_candidates=10, final_k=top_k)
+    generation = generate_answer(query, retrieved)
     retrieved_map = {
-        key: c.parent_text
-        for c in retrieved
-        for key in (c.chunk_id, f"Chunk_{c.chunk_id}")
+        key: chunk.text
+        for chunk in retrieved
+        for key in (chunk.chunk_id, f"Chunk_{chunk.chunk_id}")
     }
-    claims = []
-    abstention = "The provided documentation does not contain sufficient evidence to answer this inquiry."
-    if gen_res.answer != abstention:
-        for sentence in _re.split(r"(?<=[.!?])\s+", gen_res.answer.strip()):
-            sentence = sentence.strip()
-            if not sentence:
-                continue
-            cited_ids = _re.findall(r"\[Chunk_([^\]]+)\]", sentence)
-            claim = _re.sub(r"\[Chunk_[^\]]+\]", "", sentence).strip()
-            claims.extend(
-                {"claim": claim, "citation": f"Chunk_{chunk_id}"}
-                for chunk_id in cited_ids
-            )
-            if not cited_ids and claim:
-                claims.append({"claim": claim, "citation": ""})
-    eval_res = evaluator.evaluate_generation(claims, retrieved_map)
+    claims = extract_claims(generation.answer)
+    evaluation = evaluator.evaluate_generation(claims, retrieved_map)
     chunks_by_citation = {f"Chunk_{chunk.chunk_id}": chunk for chunk in retrieved}
     return {
-        "answer": gen_res.answer,
-        "citations": gen_res.citations,
+        "answer": generation.answer,
+        "citations": generation.citations,
         "citation_details": [
             {
                 "citation": citation,
-                "source_name": chunks_by_citation[citation].source_name or chunks_by_citation[citation].doc_id,
+                "source_name": chunks_by_citation[citation].source_name
+                or chunks_by_citation[citation].doc_id,
                 "page_number": chunks_by_citation[citation].page_number,
             }
-            for citation in gen_res.citations
+            for citation in generation.citations
             if citation in chunks_by_citation
         ],
-        "faithfulness_score": eval_res.faithfulness_score,
-        "violations": eval_res.violations or None,
+        "faithfulness_score": evaluation.faithfulness_score,
+        "violations": evaluation.violations or None,
+        "latency_ms": {},
     }
 
 
@@ -328,150 +177,218 @@ def index_inline_documents(files: list) -> dict[str, Any]:
     from rag_hybrid.src.ingestion import chunk_document_segments, read_document_segments
 
     rag, _, _, _ = _load_inline_pipeline()
-    all_chunks = []
-    indexed_files = []
+    chunks = []
+    names = []
     for file in files:
         _, segments = read_document_segments(file.name, file.getvalue())
-        chunks = chunk_document_segments(file.name, segments)
-        if not chunks:
-            raise ValueError(f"{file.name}: document is empty")
-        indexed_files.append(file.name)
-        all_chunks.extend(chunks)
-    added = rag.replace_sources(all_chunks)
-    return {
-        "files": indexed_files,
-        "chunks_indexed": len(added),
-        "total_chunks": len(rag.corpus_chunks),
-    }
+        document_chunks = chunk_document_segments(file.name, segments)
+        if not document_chunks:
+            raise ValueError(f"{file.name}: document contains no indexable text")
+        names.append(file.name)
+        chunks.extend(document_chunks)
+    added = rag.replace_sources(chunks)
+    return {"files": names, "chunks_indexed": len(added), "total_chunks": len(rag.corpus_chunks)}
 
 
-if index_uploads and stfile:
-    with st.spinner("Parsing, chunking, embedding, and indexing…"):
-        try:
-            upload_result = (
-                upload_documents(stfile)
-                if mode == "API (FastAPI)"
-                else index_inline_documents(stfile)
-            )
-            st.success(
-                f"Indexed {upload_result['chunks_indexed']} chunks from "
-                f"{len(upload_result['files'])} document(s). "
-                f"Total indexed chunks: {upload_result['total_chunks']}."
-            )
-        except requests.RequestException as exc:
-            if isinstance(exc, requests.ConnectionError):
-                st.error(f"Cannot connect to FastAPI at {api_url.rstrip('/')}.")
-                st.info("Start the API in another terminal and leave it running while you use the UI:")
-                st.code(API_START_COMMAND, language="powershell")
-            else:
-                st.error(f"Document indexing failed: {exc}")
-        except (KeyError, ValueError) as exc:
-            st.error(f"Document indexing failed: {exc}")
-        except Exception as exc:
-            st.error(f"Document indexing failed: {exc}")
-
-
-# ---------------------------------------------------------------------------
-# Process query
-# ---------------------------------------------------------------------------
-if submit and query.strip():
-    with st.spinner("Retrieving and generating…"):
-        t0 = time.perf_counter()
-        error = None
-        api_unavailable = False
-        result = None
-        try:
-            if mode == "API (FastAPI)":
-                result = call_api(query.strip())
-            else:
-                result = call_inline(query.strip())
-        except requests.ConnectionError:
-            error = f"Cannot connect to FastAPI at {api_url.rstrip('/')}"
-            api_unavailable = True
-        except Exception as exc:
-            error = str(exc)
-        elapsed = time.perf_counter() - t0
-
-    if error:
-        st.error(f"❌ Error: {error}")
-        if api_unavailable:
-            st.info("Start the API in another terminal and leave it running while you use the UI:")
+def render_assistant_message(message: dict[str, Any], show_violations: bool) -> None:
+    result = message.get("result")
+    if not result:
+        st.error(message.get("error", "The request failed."))
+        if message.get("api_unavailable"):
+            st.info("Start the API in a terminal and leave it running while you use the UI:")
             st.code(API_START_COMMAND, language="powershell")
-    else:
-        assert result is not None
-        # Save to history
-        st.session_state.history.insert(
-            0,
-            {"query": query, "result": result, "elapsed": elapsed},
-        )
+        return
 
-        # ---- Display result ----
-        st.markdown("---")
+    st.markdown(result.get("answer", "No answer returned."))
+    if message.get("source_mode") == "Web search":
+        sources = result.get("sources", [])
+        st.caption(f"Web search · {len(sources)} source(s) · {message['elapsed']:.2f}s")
+        for index, source in enumerate(sources, start=1):
+            title = source.get("title") or source.get("url") or f"Source {index}"
+            st.markdown(f"{index}. [{title}]({source.get('url', '')})")
+            if source.get("content"):
+                st.caption(source["content"])
+        return
 
-        # Answer
-        with st.container(border=True):
-            st.markdown(result["answer"])
+    faithfulness = result.get("faithfulness_score")
+    citations = result.get("citations", [])
+    metric1, metric2, metric3 = st.columns(3)
+    metric1.metric("Evidence support", f"{faithfulness:.0%}" if faithfulness is not None else "N/A")
+    metric2.metric("Citations", len(citations))
+    metric3.metric("Answer time", f"{message['elapsed']:.2f}s")
 
-        # Metrics row
-        c1, c2, c3 = st.columns(3)
-        faith = result.get("faithfulness_score")
-        faith_color = (
-            "#22c55e" if faith is not None and faith >= 0.8
-            else "#f59e0b" if faith is not None and faith >= 0.5
-            else "#94a3b8" if faith is None
-            else "#ef4444"
-        )
-        faith_text = f"{faith:.0%}" if faith is not None else "N/A"
-        with c1:
-            st.markdown(
-                f'<div class="metric-card"><div style="font-size:1.8rem;font-weight:700;color:{faith_color};">'
-                f'{faith_text}</div><div style="color:#94a3b8;font-size:0.85rem;">Evidence support</div></div>',
-                unsafe_allow_html=True,
+    details = result.get("citation_details") or []
+    if details:
+        labels = []
+        for item in details:
+            label = item.get("source_name") or item.get("citation", "Source")
+            if item.get("page_number") is not None:
+                label += f", p. {item['page_number']}"
+            if item.get("citation"):
+                label += f" ({item['citation']})"
+            labels.append(label)
+        st.markdown("**📎 Paper sources**")
+        for label in labels:
+            st.markdown(f"- {label}")
+    elif citations:
+        st.caption("Citations: " + " · ".join(citations))
+
+    timings = result.get("latency_ms") or {}
+    if timings:
+        with st.expander("Latency details"):
+            st.caption(" · ".join(f"{name}: {value:.0f} ms" for name, value in timings.items()))
+
+    if show_violations and result.get("violations"):
+        with st.expander("Citation checks", expanded=False):
+            for violation in result["violations"]:
+                st.warning(violation)
+
+
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
+with st.sidebar:
+    st.markdown("## ⚙️ Settings")
+    api_url = st.text_input(
+        "API base URL",
+        value=os.getenv("RAG_API_URL", "http://localhost:8000"),
+        help="URL of the FastAPI backend",
+    )
+    backend = st.radio(
+        "Backend",
+        ["API (FastAPI)", "Inline demo"],
+        help="API mode keeps indexed papers in the persistent vector database. Inline demo is temporary and uses synthetic content.",
+    )
+    search_mode = st.radio(
+        "Search in",
+        ["Indexed papers", "Web search"],
+        horizontal=True,
+        help="Web search sends the question to Tavily only after you select this option and submit it.",
+    )
+    top_k = st.slider("Retrieved paper chunks", min_value=1, max_value=10, value=5)
+    show_violations = st.checkbox("Show citation checks", value=False)
+    st.divider()
+    st.markdown("### 📚 Your papers")
+    if backend == "API (FastAPI)":
+        library_status = call_readiness(api_url)
+        if library_status:
+            st.caption(
+                f"Library: {library_status.get('indexed_chunks', 0)} chunks from "
+                f"{library_status.get('indexed_sources', 0)} source(s)."
             )
-        with c2:
-            n_cit = len(result.get("citations", []))
-            st.markdown(
-                f'<div class="metric-card"><div style="font-size:1.8rem;font-weight:700;color:#a5b4fc;">'
-                f'{n_cit}</div><div style="color:#94a3b8;font-size:0.85rem;">Citations</div></div>',
-                unsafe_allow_html=True,
-            )
-        with c3:
-            st.markdown(
-                f'<div class="metric-card"><div style="font-size:1.8rem;font-weight:700;color:#c4b5fd;">'
-                f'{elapsed:.2f}s</div><div style="color:#94a3b8;font-size:0.85rem;">Latency</div></div>',
-                unsafe_allow_html=True,
-            )
+            if not library_status.get("indexed_chunks"):
+                st.info("No papers are indexed yet. Upload a text-based PDF, DOCX, Markdown, or text file below.")
+            elif library_status.get("model_warmup_status") == "pending":
+                st.caption("Retrieval models are warming up in the background.")
+        else:
+            st.warning("FastAPI is unavailable. Start the local services to view and upload your library.")
+            st.code(API_START_COMMAND, language="powershell")
+    uploaded_files = st.file_uploader(
+        "Upload PDF, DOCX, Markdown, or text",
+        type=["pdf", "txt", "md", "docx"],
+        accept_multiple_files=True,
+    )
+    index_uploads = st.button(
+        "Index uploaded papers",
+        disabled=not uploaded_files,
+        use_container_width=True,
+    )
+    st.divider()
+    st.caption("Hybrid dense + BM25 retrieval · source citations · evidence checks")
 
-        # Citations
-        if result.get("citations"):
-            st.markdown("**📎 Sources**")
-            details = result.get("citation_details") or []
-            if details:
-                labels = []
-                for item in details:
-                    label = item["source_name"]
-                    if item.get("page_number") is not None:
-                        label += f", p. {item['page_number']}"
-                    labels.append(f"{label} ({item['citation']})")
-                st.caption(" · ".join(labels))
+st.markdown(
+    """
+    <div class="hero-card">
+        <h1 style="margin:0;font-size:2rem;background:linear-gradient(90deg,#a5b4fc,#c4b5fd);
+            -webkit-background-clip:text;-webkit-text-fill-color:transparent;">
+            📄 Research Paper Assistant
+        </h1>
+        <p style="color:#cbd5e1;margin:0.5rem 0 0;">
+            Chat with your indexed papers or switch to web search for broader research.
+            Paper answers include citations and page numbers.
+        </p>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+
+if index_uploads and uploaded_files:
+    try:
+        with st.spinner("Reading, chunking, and indexing papers…"):
+            if backend == "API (FastAPI)":
+                indexed = upload_documents(api_url, uploaded_files)
             else:
-                st.caption(" · ".join(str(c) for c in result["citations"]))
+                indexed = index_inline_documents(uploaded_files)
+        if indexed["chunks_indexed"]:
+            st.sidebar.success(
+                f"Added {indexed['chunks_indexed']} chunks from {len(indexed['files'])} file(s). "
+                f"Library total: {indexed['total_chunks']} chunks."
+            )
+        else:
+            st.sidebar.info(
+                f"No new chunks were needed; the uploaded content is already indexed. "
+                f"Library total: {indexed['total_chunks']} chunks."
+            )
+    except requests.ConnectionError:
+        st.sidebar.error(f"Cannot connect to FastAPI at {api_url.rstrip('/')}")
+        st.sidebar.code(API_START_COMMAND, language="powershell")
+    except (requests.RequestException, RuntimeError, ValueError) as exc:
+        st.sidebar.error(f"Indexing failed: {exc}")
+    except Exception as exc:
+        st.sidebar.error(f"Indexing failed: {exc}")
 
-        # Violations
-        if show_violations and result.get("violations"):
-            st.markdown("**⚠️ Citation violations**")
-            for v in result["violations"]:
-                st.warning(v)
+if not st.session_state.messages:
+    st.markdown(
+        "Ask a question to get started. Try *“What problem does this paper address?”* or "
+        "*“What evidence supports its main result?”*"
+    )
 
-# ---------------------------------------------------------------------------
-# Query history
-# ---------------------------------------------------------------------------
-# if st.session_state.history:
-#     st.markdown("---")
-#     with st.expander(f"🕑 Query history ({len(st.session_state.history)} queries)", expanded=False):
-#         for i, h in enumerate(st.session_state.history):
-#             st.markdown(
-#                 f"**{i+1}. {h['query']}** — "
-#                 f"faithfulness: `{h['result'].get('faithfulness_score', 0):.0%}` | "
-#                 f"latency: `{h['elapsed']:.2f}s`"
-#             )
+for message in st.session_state.messages:
+    with st.chat_message(message["role"]):
+        if message["role"] == "user":
+            st.markdown(message["content"])
+        else:
+            render_assistant_message(message, show_violations)
+
+placeholder = "Search the web…" if search_mode == "Web search" else "Ask about your papers…"
+prompt = st.chat_input(placeholder)
+
+if prompt and prompt.strip():
+    query = prompt.strip()
+    st.session_state.messages.append({"role": "user", "content": query})
+    with st.chat_message("user"):
+        st.markdown(query)
+
+    new_message: dict[str, Any] = {"role": "assistant", "source_mode": search_mode}
+    if search_mode == "Web search" and backend != "API (FastAPI)":
+        new_message["error"] = "Web search requires the API (FastAPI) backend. Select it in Settings."
+    else:
+        if search_mode == "Indexed papers" and backend == "API (FastAPI)":
+            readiness = call_readiness(api_url)
+            if readiness and not readiness.get("models_ready", False):
+                if readiness.get("model_warmup_status") == "failed":
+                    st.info("Background model warmup failed. This request may load models on demand; check the API terminal for details.")
+                else:
+                    st.info("Retrieval models are still warming up. The first answer may take longer.")
+        started = time.perf_counter()
+        try:
+            with st.spinner("Searching and preparing your answer…"):
+                if search_mode == "Web search":
+                    response = call_web_search(api_url, query)
+                elif backend == "API (FastAPI)":
+                    response = call_api(api_url, query, top_k)
+                else:
+                    response = call_inline(query, top_k)
+            new_message["result"] = response
+        except requests.ConnectionError as exc:
+            new_message["error"] = f"Cannot connect to FastAPI at {api_url.rstrip('/')}: {exc}"
+            new_message["api_unavailable"] = True
+        except (requests.RequestException, RuntimeError, ValueError) as exc:
+            new_message["error"] = str(exc)
+        except Exception as exc:
+            new_message["error"] = str(exc)
+        new_message["elapsed"] = time.perf_counter() - started
+
+    st.session_state.messages.append(new_message)
+    with st.chat_message("assistant"):
+        render_assistant_message(new_message, show_violations)

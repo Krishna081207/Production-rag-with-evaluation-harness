@@ -1,10 +1,11 @@
 """FastAPI application for the hybrid RAG pipeline."""
 
+import asyncio
 import hmac
 import logging
 import os
-import re
 import threading
+import time
 from pathlib import Path
 
 from fastapi import FastAPI, File, Header, HTTPException, UploadFile
@@ -14,13 +15,18 @@ from starlette.concurrency import run_in_threadpool
 from rag_hybrid.src.config import max_upload_bytes
 from rag_hybrid.src.corpus_store import load_corpus, save_corpus
 from rag_hybrid.src.eval.faithfulness import FaithfulnessEvaluator
-from rag_hybrid.src.generator.generator import ABSTENTION, generate_answer
+from rag_hybrid.src.generator.generator import extract_claims, generate_answer
 from rag_hybrid.src.ingestion import (
     SUPPORTED_EXTENSIONS,
     chunk_document_segments,
     read_document_segments,
 )
 from rag_hybrid.src.retriever.hybrid import DocumentChunk, ProductionHybridRAG
+from rag_hybrid.src.web_search import (
+    WebSearchConfigurationError,
+    WebSearchError,
+    search_web,
+)
 
 logger = logging.getLogger(__name__)
 app = FastAPI(title="Research Paper Understanding RAG", version="0.2.0")
@@ -28,10 +34,13 @@ app = FastAPI(title="Research Paper Understanding RAG", version="0.2.0")
 _rag: ProductionHybridRAG | None = None
 _evaluator: FaithfulnessEvaluator | None = None
 _initialization_lock = threading.RLock()
+_model_warmup_status = "pending"
+_model_warmup_task: asyncio.Task | None = None
 
 
 class QueryRequest(BaseModel):
     query: str = Field(min_length=1, max_length=3000)
+    top_k: int = Field(default=5, ge=1, le=10)
 
     @field_validator("query")
     @classmethod
@@ -48,12 +57,25 @@ class QueryResponse(BaseModel):
     citation_details: list[dict[str, str | int | None]]
     faithfulness_score: float | None
     violations: list[str] | None = None
+    latency_ms: dict[str, float]
 
 
 class UploadResponse(BaseModel):
     files: list[str]
     chunks_indexed: int
     total_chunks: int
+
+
+class WebSearchSource(BaseModel):
+    title: str
+    url: str
+    content: str
+    score: float | None = None
+
+
+class WebSearchResponse(BaseModel):
+    answer: str
+    sources: list[WebSearchSource]
 
 
 def _get_rag() -> ProductionHybridRAG:
@@ -82,6 +104,29 @@ def _get_evaluator() -> FaithfulnessEvaluator:
     return _evaluator
 
 
+def _warm_models() -> None:
+    """Load model weights in the background so the first query is not a cold start."""
+    global _model_warmup_status
+    try:
+        rag = _get_rag()
+        _ = rag.dense_model
+        _ = rag.reranker
+        _ = _get_evaluator().nli
+        _model_warmup_status = "ready"
+        logger.info("Retrieval and evaluation models are warm")
+    except Exception:
+        _model_warmup_status = "failed"
+        logger.exception("Background model warmup failed; models will load on first use")
+
+
+@app.on_event("startup")
+async def schedule_model_warmup() -> None:
+    """Start model loading without delaying FastAPI's readiness endpoint."""
+    global _model_warmup_status, _model_warmup_task
+    _model_warmup_status = "pending"
+    _model_warmup_task = asyncio.create_task(asyncio.to_thread(_warm_models))
+
+
 def _replace_and_save(rag: ProductionHybridRAG, chunks: list[DocumentChunk]) -> list[DocumentChunk]:
     """Replace source versions and persist the matching sparse-corpus snapshot."""
     with _initialization_lock:
@@ -99,21 +144,7 @@ def _evaluate_claims(
 
 def _extract_claims(answer: str) -> list[dict[str, str]]:
     """Create one verifiable claim per sentence and cited chunk ID."""
-    if answer.strip() == ABSTENTION:
-        return []
-
-    claims: list[dict[str, str]] = []
-    sentences = [part.strip() for part in re.split(r"(?<=[.!?])\s+", answer.strip()) if part.strip()]
-    for sentence in sentences:
-        cited_ids = re.findall(r"\[Chunk_([^\]]+)\]", sentence)
-        claim = re.sub(r"\[Chunk_[^\]]+\]", "", sentence).strip()
-        if not claim:
-            continue
-        if cited_ids:
-            claims.extend({"claim": claim, "citation": f"Chunk_{chunk_id}"} for chunk_id in cited_ids)
-        else:
-            claims.append({"claim": claim, "citation": ""})
-    return claims
+    return extract_claims(answer)
 
 
 def _safe_filename(filename: str) -> str:
@@ -131,13 +162,21 @@ async def health_check() -> dict[str, str]:
 
 
 @app.get("/ready")
-async def readiness_check() -> dict[str, str | int]:
+async def readiness_check() -> dict[str, str | int | bool]:
     try:
         rag = await run_in_threadpool(_get_rag)
     except Exception as exc:
         logger.exception("RAG backend is not ready")
         raise HTTPException(status_code=503, detail="RAG backend is not ready") from exc
-    return {"status": "ready", "indexed_chunks": len(rag.corpus_chunks)}
+    return {
+        "status": "ready",
+        "indexed_chunks": len(rag.corpus_chunks),
+        "indexed_sources": len(
+            {chunk.source_name or chunk.doc_id for chunk in rag.corpus_chunks}
+        ),
+        "models_ready": _model_warmup_status == "ready",
+        "model_warmup_status": _model_warmup_status,
+    }
 
 
 @app.post("/documents", response_model=UploadResponse)
@@ -208,20 +247,40 @@ async def upload_documents(
     )
 
 
+@app.post("/web-search", response_model=WebSearchResponse)
+async def web_search_endpoint(req: QueryRequest) -> WebSearchResponse:
+    """Search the public web through the optional Tavily provider."""
+    try:
+        result = await run_in_threadpool(search_web, req.query)
+    except WebSearchConfigurationError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except WebSearchError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return WebSearchResponse(**result)
+
+
 @app.post("/query", response_model=QueryResponse)
 async def query_endpoint(req: QueryRequest) -> QueryResponse:
+    total_started = time.perf_counter()
     try:
+        retrieval_started = time.perf_counter()
         rag = await run_in_threadpool(_get_rag)
         retrieved_chunks = await run_in_threadpool(
             rag.hybrid_retrieve,
             req.query,
-            top_candidates=20,
-            final_k=5,
+            top_candidates=max(10, req.top_k * 2),
+            final_k=req.top_k,
         )
+        retrieval_ms = (time.perf_counter() - retrieval_started) * 1000
+
+        generation_started = time.perf_counter()
         generation = await run_in_threadpool(generate_answer, req.query, retrieved_chunks)
+        generation_ms = (time.perf_counter() - generation_started) * 1000
+
+        evaluation_started = time.perf_counter()
         claims = _extract_claims(generation.answer)
         retrieved_map = {
-            key: chunk.parent_text
+            key: chunk.text
             for chunk in retrieved_chunks
             for key in (chunk.chunk_id, f"Chunk_{chunk.chunk_id}")
         }
@@ -233,6 +292,7 @@ async def query_endpoint(req: QueryRequest) -> QueryResponse:
             )
         else:
             evaluation = None
+        evaluation_ms = (time.perf_counter() - evaluation_started) * 1000
     except Exception as exc:
         logger.exception("RAG query failed")
         raise HTTPException(status_code=503, detail="The RAG service could not complete the query") from exc
@@ -256,4 +316,10 @@ async def query_endpoint(req: QueryRequest) -> QueryResponse:
         citation_details=citation_details,
         faithfulness_score=evaluation.faithfulness_score if evaluation else None,
         violations=evaluation.violations or None if evaluation else None,
+        latency_ms={
+            "retrieval": round(retrieval_ms, 1),
+            "generation": round(generation_ms, 1),
+            "evidence_check": round(evaluation_ms, 1),
+            "total": round((time.perf_counter() - total_started) * 1000, 1),
+        },
     )

@@ -37,6 +37,8 @@ Copy-Item .env.example .env
 
 Edit `.env` and set a long random `ADMIN_API_KEY` to enable uploads. Set `GROQ_API_KEY` for generated answers; without it, the application returns a cited extractive answer. The default local setup uses Qdrant at `rag_hybrid/data/qdrant` and saves the sparse corpus under `rag_hybrid/data/`.
 
+The chat UI can search either your indexed papers or the public web. For web search, set `TAVILY_API_KEY` in `.env`; web queries are sent to Tavily only when **Web search** is selected. The [Tavily Search API](https://docs.tavily.com/documentation/api-reference/endpoint/search) returns an answer with linked source snippets. Retrieval models load in the background after API startup, and the UI shows retrieval, generation, and evidence-check timing for paper answers.
+
 For local testing, start both services from one terminal:
 
 ```powershell
@@ -71,7 +73,7 @@ python rag_hybrid/scripts/ingest.py --vector-db pinecone --source rag_hybrid/dat
 
 ## API
 
-`GET /health` is a liveness check. `GET /ready` initializes the retrieval store and reports the indexed chunk count. Uploads require the configured admin key:
+`GET /health` is a liveness check. `GET /ready` reports indexed chunk/source counts and model warmup status. Uploads require the configured admin key. If the same unchanged paper is uploaded again, the UI reports that its chunks are already indexed; scanned PDFs need OCR before upload:
 
 ```powershell
 curl.exe -X POST http://localhost:8000/documents `
@@ -88,6 +90,8 @@ curl.exe -X POST http://localhost:8000/query `
 ```
 
 The response includes the answer, chunk citations, file/page details, an evidence-support score, and any unsupported-claim notes. The NLI score is an automated estimate and should be checked against the cited passage for consequential use.
+
+Optional public web search is available at `POST /web-search` when `TAVILY_API_KEY` is configured. It returns an answer and a list of source titles, URLs, and snippets. `/ready` also reports whether background retrieval-model warmup has completed.
 
 ## Evaluation
 
@@ -138,6 +142,7 @@ Compose persists the local Qdrant database and corpus in the `rag_data` volume. 
 | `RERANKER_MODEL` | Cross-encoder reranker | `cross-encoder/ms-marco-MiniLM-L-6-v2` |
 | `GROQ_API_KEY` | Optional key for generated answers | unset (extractive fallback) |
 | `GROQ_MODEL` | Groq model ID | `openai/gpt-oss-20b` |
+| `TAVILY_API_KEY` | Optional Tavily key for web search mode | unset |
 | `ADMIN_API_KEY` | Required key for API document uploads | unset (uploads disabled) |
 | `MAX_UPLOAD_BYTES` | Maximum size per file; combined request limit is twice this | `10485760` |
 | `PINECONE_API_KEY` | Optional Pinecone key | unset |
