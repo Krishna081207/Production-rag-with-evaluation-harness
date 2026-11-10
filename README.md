@@ -93,6 +93,8 @@ The response includes the answer, chunk citations, file/page details, an evidenc
 
 Optional public web search is available at `POST /web-search` when `TAVILY_API_KEY` is configured. It returns an answer and a list of source titles, URLs, and snippets. `/ready` also reports whether background retrieval-model warmup has completed.
 
+`GET /documents` lists indexed source names and chunk counts. The Streamlit sidebar can remove selected papers or clear the full library. Both operations update Qdrant/Pinecone and the saved BM25 corpus; deletion requires `X-Admin-Key`. The clear-all action requires an explicit confirmation in the UI.
+
 ## Evaluation
 
 Run the retrieval ablation harness:

@@ -9,7 +9,7 @@ import time
 from pathlib import Path
 
 from fastapi import FastAPI, File, Header, HTTPException, UploadFile
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from starlette.concurrency import run_in_threadpool
 
 from rag_hybrid.src.config import max_upload_bytes
@@ -65,6 +65,36 @@ class QueryResponse(BaseModel):
 class UploadResponse(BaseModel):
     files: list[str]
     chunks_indexed: int
+    total_chunks: int
+
+
+class IndexedDocument(BaseModel):
+    source_name: str
+    chunks: int
+
+
+class DocumentsResponse(BaseModel):
+    documents: list[IndexedDocument]
+    total_chunks: int
+
+
+class DeleteDocumentsRequest(BaseModel):
+    source_names: list[str] = Field(default_factory=list, max_length=100)
+    clear_all: bool = False
+
+    @model_validator(mode="after")
+    def validate_delete_target(self):
+        self.source_names = list(
+            dict.fromkeys(name.strip() for name in self.source_names if name.strip())
+        )
+        if self.clear_all == bool(self.source_names):
+            raise ValueError("Choose specific source_names or set clear_all=true")
+        return self
+
+
+class DeleteDocumentsResponse(BaseModel):
+    sources_removed: list[str]
+    chunks_removed: int
     total_chunks: int
 
 
@@ -138,6 +168,29 @@ def _replace_and_save(rag: ProductionHybridRAG, chunks: list[DocumentChunk]) -> 
         return added
 
 
+def _delete_and_save(
+    rag: ProductionHybridRAG, source_names: list[str], clear_all: bool = False
+) -> list[DocumentChunk]:
+    """Remove source chunks from both indexes and persist the resulting corpus."""
+    with _initialization_lock:
+        targets = (
+            sorted({chunk.source_name or chunk.doc_id for chunk in rag.corpus_chunks})
+            if clear_all
+            else source_names
+        )
+        removed = rag.remove_sources(targets)
+        save_corpus(rag.corpus_chunks)
+        return removed
+
+
+def _require_admin_key(provided_key: str | None) -> None:
+    expected_key = os.getenv("ADMIN_API_KEY", "")
+    if not expected_key:
+        raise HTTPException(status_code=503, detail="Document management is disabled until ADMIN_API_KEY is set")
+    if not provided_key or not hmac.compare_digest(provided_key, expected_key):
+        raise HTTPException(status_code=401, detail="Invalid admin key")
+
+
 def _evaluate_claims(
     claims: list[dict[str, str]], retrieved_map: dict[str, str]
 ):
@@ -182,17 +235,33 @@ async def readiness_check() -> dict[str, str | int | bool]:
     }
 
 
+@app.get("/documents", response_model=DocumentsResponse)
+async def list_documents() -> DocumentsResponse:
+    """List indexed source names and their chunk counts."""
+    try:
+        rag = await run_in_threadpool(_get_rag)
+    except Exception as exc:
+        logger.exception("Could not list indexed documents")
+        raise HTTPException(status_code=503, detail="RAG backend is not ready") from exc
+
+    counts: dict[str, int] = {}
+    for chunk in rag.corpus_chunks:
+        source_name = chunk.source_name or chunk.doc_id
+        counts[source_name] = counts.get(source_name, 0) + 1
+    documents = [
+        IndexedDocument(source_name=name, chunks=count)
+        for name, count in sorted(counts.items())
+    ]
+    return DocumentsResponse(documents=documents, total_chunks=len(rag.corpus_chunks))
+
+
 @app.post("/documents", response_model=UploadResponse)
 async def upload_documents(
     files: list[UploadFile] = File(...),
     x_admin_key: str | None = Header(default=None, alias="X-Admin-Key"),
 ) -> UploadResponse:
     """Parse, chunk, and index uploads; ingestion requires an explicit admin key."""
-    expected_key = os.getenv("ADMIN_API_KEY", "")
-    if not expected_key:
-        raise HTTPException(status_code=503, detail="Document uploads are disabled until ADMIN_API_KEY is set")
-    if not x_admin_key or not hmac.compare_digest(x_admin_key, expected_key):
-        raise HTTPException(status_code=401, detail="Invalid admin key")
+    _require_admin_key(x_admin_key)
     if not files:
         raise HTTPException(status_code=400, detail="At least one file is required")
     if len(files) > 10:
@@ -246,6 +315,32 @@ async def upload_documents(
     return UploadResponse(
         files=indexed_files,
         chunks_indexed=len(added),
+        total_chunks=len(rag.corpus_chunks),
+    )
+
+
+@app.delete("/documents", response_model=DeleteDocumentsResponse)
+async def delete_documents(
+    req: DeleteDocumentsRequest,
+    x_admin_key: str | None = Header(default=None, alias="X-Admin-Key"),
+) -> DeleteDocumentsResponse:
+    """Remove selected indexed papers or explicitly clear the full library."""
+    _require_admin_key(x_admin_key)
+    try:
+        rag = await run_in_threadpool(_get_rag)
+        removed = await run_in_threadpool(
+            _delete_and_save,
+            rag,
+            req.source_names,
+            req.clear_all,
+        )
+    except Exception as exc:
+        logger.exception("Document removal failed")
+        raise HTTPException(status_code=503, detail="Document removal failed; check backend configuration") from exc
+
+    return DeleteDocumentsResponse(
+        sources_removed=sorted({chunk.source_name or chunk.doc_id for chunk in removed}),
+        chunks_removed=len(removed),
         total_chunks=len(rag.corpus_chunks),
     )
 

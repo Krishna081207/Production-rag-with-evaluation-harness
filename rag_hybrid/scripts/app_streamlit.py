@@ -87,6 +87,25 @@ def call_readiness(base_url: str) -> dict[str, Any] | None:
         return None
 
 
+def call_documents(base_url: str) -> dict[str, Any]:
+    response = requests.get(f"{base_url.rstrip('/')}/documents", timeout=10)
+    _raise_for_api_error(response)
+    return response.json()
+
+
+def remove_api_documents(
+    base_url: str, source_names: list[str] | None = None, clear_all: bool = False
+) -> dict[str, Any]:
+    response = requests.delete(
+        f"{base_url.rstrip('/')}/documents",
+        json={"source_names": source_names or [], "clear_all": clear_all},
+        headers={"X-Admin-Key": os.getenv("ADMIN_API_KEY", "")},
+        timeout=30,
+    )
+    _raise_for_api_error(response)
+    return response.json()
+
+
 def upload_documents(base_url: str, files: list) -> dict[str, Any]:
     payload = [
         ("files", (file.name, file.getvalue(), file.type or "application/octet-stream"))
@@ -147,6 +166,7 @@ def _load_inline_pipeline():
 
 def call_inline(query: str, top_k: int) -> dict[str, Any]:
     rag, evaluator, generate_answer, extract_claims = _load_inline_pipeline()
+    st.session_state.inline_pipeline_loaded = True
     retrieved = rag.hybrid_retrieve(query, top_candidates=10, final_k=top_k)
     generation = generate_answer(query, retrieved)
     retrieved_map = {
@@ -195,6 +215,7 @@ def index_inline_documents(files: list) -> dict[str, Any]:
     from rag_hybrid.src.ingestion import chunk_document_segments, read_document_segments
 
     rag, _, _, _ = _load_inline_pipeline()
+    st.session_state.inline_pipeline_loaded = True
     chunks = []
     names = []
     for file in files:
@@ -314,6 +335,12 @@ with st.sidebar:
     if backend == "API (FastAPI)":
         library_status = call_readiness(api_url)
         if library_status:
+            try:
+                document_data = call_documents(api_url)
+            except (requests.RequestException, RuntimeError, ValueError) as exc:
+                document_data = None
+                st.warning(f"Could not load the indexed paper list: {exc}")
+
             st.caption(
                 f"Library: {library_status.get('indexed_chunks', 0)} chunks from "
                 f"{library_status.get('indexed_sources', 0)} source(s)."
@@ -322,9 +349,92 @@ with st.sidebar:
                 st.info("No papers are indexed yet. Upload a text-based PDF, DOCX, Markdown, or text file below.")
             elif library_status.get("model_warmup_status") == "pending":
                 st.caption("Retrieval models are warming up in the background.")
+
+            if document_data and document_data["documents"]:
+                documents = document_data["documents"]
+                source_names = [document["source_name"] for document in documents]
+                chunk_counts = {
+                    document["source_name"]: document["chunks"] for document in documents
+                }
+                selected_sources = st.multiselect(
+                    "Remove selected papers",
+                    options=source_names,
+                    format_func=lambda name: f"{name} · {chunk_counts[name]} chunks",
+                    key=f"remove_sources_{len(source_names)}_{document_data['total_chunks']}",
+                )
+                if st.button("Remove selected", disabled=not selected_sources):
+                    try:
+                        removed = remove_api_documents(api_url, source_names=selected_sources)
+                        st.session_state.library_action_notice = (
+                            f"Removed {removed['chunks_removed']} chunks from "
+                            f"{len(removed['sources_removed'])} paper(s). "
+                            f"Library total: {removed['total_chunks']} chunks."
+                        )
+                        st.rerun()
+                    except (requests.RequestException, RuntimeError, ValueError) as exc:
+                        st.error(f"Could not remove selected papers: {exc}")
+
+                confirm_key = f"confirm_clear_library_{document_data['total_chunks']}"
+                confirm_clear = st.checkbox(
+                    "Confirm clearing every indexed paper",
+                    key=confirm_key,
+                )
+                if st.button(
+                    "Clear entire library",
+                    disabled=not confirm_clear,
+                    type="secondary",
+                ):
+                    try:
+                        removed = remove_api_documents(api_url, clear_all=True)
+                        st.session_state.library_action_notice = (
+                            f"Cleared {removed['chunks_removed']} chunks from "
+                            f"{len(removed['sources_removed'])} paper(s)."
+                        )
+                        st.rerun()
+                    except (requests.RequestException, RuntimeError, ValueError) as exc:
+                        st.error(f"Could not clear the library: {exc}")
+
+            if "library_action_notice" in st.session_state:
+                st.success(st.session_state.pop("library_action_notice"))
         else:
             st.warning("FastAPI is unavailable. Start the local services to view and upload your library.")
             st.code(API_START_COMMAND, language="powershell")
+    elif st.session_state.get("inline_pipeline_loaded"):
+        inline_rag, _, _, _ = _load_inline_pipeline()
+        inline_counts: dict[str, int] = {}
+        for chunk in inline_rag.corpus_chunks:
+            source_name = chunk.source_name or chunk.doc_id
+            if source_name != "synthetic_demo_paper.pdf":
+                inline_counts[source_name] = inline_counts.get(source_name, 0) + 1
+        st.caption(
+            f"Temporary inline uploads: {sum(inline_counts.values())} chunks from "
+            f"{len(inline_counts)} paper(s)."
+        )
+        if inline_counts:
+            selected_inline = st.multiselect(
+                "Remove selected inline papers",
+                options=sorted(inline_counts),
+                format_func=lambda name: f"{name} · {inline_counts[name]} chunks",
+            )
+            if st.button("Remove selected inline papers", disabled=not selected_inline):
+                removed = inline_rag.remove_sources(selected_inline)
+                st.session_state.library_action_notice = (
+                    f"Removed {len(removed)} inline chunks from {len(selected_inline)} paper(s)."
+                )
+                st.rerun()
+            confirm_inline_clear = st.checkbox("Confirm clearing all inline uploads")
+            if st.button("Clear inline uploads", disabled=not confirm_inline_clear):
+                removed = inline_rag.remove_sources(list(inline_counts))
+                st.session_state.library_action_notice = (
+                    f"Removed {len(removed)} inline chunks from {len(inline_counts)} paper(s)."
+                )
+                st.rerun()
+    else:
+        st.caption("Inline demo uploads are temporary and reset when the app restarts.")
+
+    if "library_action_notice" in st.session_state:
+        st.success(st.session_state.pop("library_action_notice"))
+
     uploaded_files = st.file_uploader(
         "Upload PDF, DOCX, Markdown, or text",
         type=["pdf", "txt", "md", "docx"],

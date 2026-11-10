@@ -279,6 +279,29 @@ class ProductionHybridRAG:
             wait=True,
         )
 
+    def remove_sources(self, source_names: Iterable[str]) -> list[DocumentChunk]:
+        """Remove selected source files from the vector and sparse indexes."""
+        targets = {name.strip() for name in source_names if name.strip()}
+        if not targets:
+            return []
+
+        with self._corpus_lock:
+            removed = [
+                chunk
+                for chunk in self.corpus_chunks
+                if (chunk.source_name or chunk.doc_id) in targets
+            ]
+            if not removed:
+                return []
+
+            self._delete_chunks(removed)
+            removed_ids = {chunk.chunk_id for chunk in removed}
+            self.corpus_chunks = [
+                chunk for chunk in self.corpus_chunks if chunk.chunk_id not in removed_ids
+            ]
+            self._build_bm25()
+            return removed
+
     def replace_sources(self, chunks: Iterable[DocumentChunk]) -> list[DocumentChunk]:
         """Replace uploaded source files by name, removing stale chunks on re-upload."""
         incoming: list[DocumentChunk] = []
