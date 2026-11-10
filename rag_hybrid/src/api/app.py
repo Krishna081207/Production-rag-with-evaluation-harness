@@ -53,8 +53,10 @@ class QueryRequest(BaseModel):
 
 class QueryResponse(BaseModel):
     answer: str
+    answer_mode: str
     citations: list[str]
     citation_details: list[dict[str, str | int | None]]
+    retrieved_sources: list[dict[str, str | int | None]]
     faithfulness_score: float | None
     violations: list[str] | None = None
     latency_ms: dict[str, float]
@@ -111,9 +113,10 @@ def _warm_models() -> None:
         rag = _get_rag()
         _ = rag.dense_model
         _ = rag.reranker
-        _ = _get_evaluator().nli
+        if os.getenv("GROQ_API_KEY") or os.getenv("groq"):
+            _ = _get_evaluator().nli
         _model_warmup_status = "ready"
-        logger.info("Retrieval and evaluation models are warm")
+        logger.info("Retrieval models and any configured answer-evaluation models are warm")
     except Exception:
         _model_warmup_status = "failed"
         logger.exception("Background model warmup failed; models will load on first use")
@@ -278,7 +281,7 @@ async def query_endpoint(req: QueryRequest) -> QueryResponse:
         generation_ms = (time.perf_counter() - generation_started) * 1000
 
         evaluation_started = time.perf_counter()
-        claims = _extract_claims(generation.answer)
+        claims = _extract_claims(generation.answer) if generation.mode == "generated" else []
         retrieved_map = {
             key: chunk.text
             for chunk in retrieved_chunks
@@ -312,8 +315,18 @@ async def query_endpoint(req: QueryRequest) -> QueryResponse:
 
     return QueryResponse(
         answer=generation.answer,
+        answer_mode=generation.mode,
         citations=generation.citations,
         citation_details=citation_details,
+        retrieved_sources=[
+            {
+                "citation": f"Chunk_{chunk.chunk_id}",
+                "source_name": chunk.source_name or chunk.doc_id,
+                "page_number": chunk.page_number,
+                "excerpt": chunk.text,
+            }
+            for chunk in retrieved_chunks
+        ],
         faithfulness_score=evaluation.faithfulness_score if evaluation else None,
         violations=evaluation.violations or None if evaluation else None,
         latency_ms={

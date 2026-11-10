@@ -35,7 +35,7 @@ python -m pip install -e ".[dev]"
 Copy-Item .env.example .env
 ```
 
-Edit `.env` and set a long random `ADMIN_API_KEY` to enable uploads. Set `GROQ_API_KEY` for generated answers; without it, the application returns a cited extractive answer. The default local setup uses Qdrant at `rag_hybrid/data/qdrant` and saves the sparse corpus under `rag_hybrid/data/`.
+Edit `.env` and set a long random `ADMIN_API_KEY` to enable uploads. Set `GROQ_API_KEY` for synthesized answers; without it, the application returns up to three query-relevant cited paper sentences and the chat exposes the retrieved passage text with its chunk and page reference. The default local setup uses Qdrant at `rag_hybrid/data/qdrant` and saves the sparse corpus under `rag_hybrid/data/`.
 
 The chat UI can search either your indexed papers or the public web. For web search, set `TAVILY_API_KEY` in `.env`; web queries are sent to Tavily only when **Web search** is selected. The [Tavily Search API](https://docs.tavily.com/documentation/api-reference/endpoint/search) returns an answer with linked source snippets. Retrieval models load in the background after API startup, and the UI shows retrieval, generation, and evidence-check timing for paper answers.
 

@@ -110,7 +110,11 @@ def _load_inline_pipeline():
     from rag_hybrid.src.retriever.hybrid import DocumentChunk, ProductionHybridRAG
 
     rag = ProductionHybridRAG(vector_db="qdrant", qdrant_path=":memory:")
-    evaluator = FaithfulnessEvaluator()
+    evaluator = (
+        FaithfulnessEvaluator()
+        if os.getenv("GROQ_API_KEY") or os.getenv("groq")
+        else None
+    )
     demo_chunks = [
         DocumentChunk(
             chunk_id="demo_retrieval_p1_c0",
@@ -151,10 +155,15 @@ def call_inline(query: str, top_k: int) -> dict[str, Any]:
         for key in (chunk.chunk_id, f"Chunk_{chunk.chunk_id}")
     }
     claims = extract_claims(generation.answer)
-    evaluation = evaluator.evaluate_generation(claims, retrieved_map)
+    evaluation = (
+        evaluator.evaluate_generation(claims, retrieved_map)
+        if generation.mode == "generated" and evaluator is not None
+        else None
+    )
     chunks_by_citation = {f"Chunk_{chunk.chunk_id}": chunk for chunk in retrieved}
     return {
         "answer": generation.answer,
+        "answer_mode": generation.mode,
         "citations": generation.citations,
         "citation_details": [
             {
@@ -166,9 +175,18 @@ def call_inline(query: str, top_k: int) -> dict[str, Any]:
             for citation in generation.citations
             if citation in chunks_by_citation
         ],
-        "faithfulness_score": evaluation.faithfulness_score,
-        "violations": evaluation.violations or None,
+        "faithfulness_score": evaluation.faithfulness_score if evaluation else None,
+        "violations": evaluation.violations or None if evaluation else None,
         "latency_ms": {},
+        "retrieved_sources": [
+            {
+                "citation": f"Chunk_{chunk.chunk_id}",
+                "source_name": chunk.source_name or chunk.doc_id,
+                "page_number": chunk.page_number,
+                "excerpt": chunk.text,
+            }
+            for chunk in retrieved
+        ],
     }
 
 
@@ -199,7 +217,16 @@ def render_assistant_message(message: dict[str, Any], show_violations: bool) -> 
             st.code(API_START_COMMAND, language="powershell")
         return
 
-    st.markdown(result.get("answer", "No answer returned."))
+    if result.get("answer_mode") == "extractive":
+        if os.getenv("GROQ_API_KEY") or os.getenv("groq"):
+            st.info("Answer synthesis failed. The retrieved paper passages are shown below.")
+        else:
+            st.info(
+                "No answer-generation model is configured. The retrieved passages below show "
+                "the paper content that matched your question. Set GROQ_API_KEY for a plain-language answer."
+            )
+    else:
+        st.markdown(result.get("answer", "No answer returned."))
     if message.get("source_mode") == "Web search":
         sources = result.get("sources", [])
         st.caption(f"Web search · {len(sources)} source(s) · {message['elapsed']:.2f}s")
@@ -232,6 +259,21 @@ def render_assistant_message(message: dict[str, Any], show_violations: bool) -> 
             st.markdown(f"- {label}")
     elif citations:
         st.caption("Citations: " + " · ".join(citations))
+
+    retrieved_sources = result.get("retrieved_sources") or []
+    if retrieved_sources:
+        with st.expander(
+            f"Retrieved paper passages ({len(retrieved_sources)})",
+            expanded=result.get("answer_mode") == "extractive",
+        ):
+            for source in retrieved_sources:
+                label = source.get("source_name") or "Paper"
+                if source.get("page_number") is not None:
+                    label += f", p. {source['page_number']}"
+                if source.get("citation"):
+                    label += f" · {source['citation']}"
+                st.markdown(f"**{label}**")
+                st.text(source.get("excerpt", ""))
 
     timings = result.get("latency_ms") or {}
     if timings:
