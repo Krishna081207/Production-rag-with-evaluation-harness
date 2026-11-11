@@ -6,7 +6,6 @@ services:
     region: singapore
     dockerfilePath: ./Dockerfile.api
     dockerContext: .
-    healthCheckPath: /health
     disk:
       name: research-paper-data
       mountPath: /app/data
