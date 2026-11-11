@@ -13,6 +13,15 @@ from dotenv import load_dotenv
 load_dotenv()
 API_START_COMMAND = "python -m rag_hybrid.scripts.run_local"
 
+for secret_name in ("GROQ_API_KEY", "GROQ_MODEL"):
+    if not os.getenv(secret_name):
+        try:
+            secret_value = st.secrets.get(secret_name)
+        except Exception:
+            secret_value = None
+        if secret_value:
+            os.environ[secret_name] = str(secret_value)
+
 st.set_page_config(
     page_title="Research Paper Assistant",
     page_icon="📄",
@@ -365,28 +374,39 @@ if "messages" not in st.session_state:
 
 with st.sidebar:
     st.markdown("## ⚙️ Settings")
-    api_url = st.text_input(
-        "API base URL",
-        value=os.getenv("RAG_API_URL", "http://localhost:8000"),
-        help="URL of the FastAPI backend",
-        disabled=os.getenv("RAG_LOCK_API_URL", "false").strip().lower() == "true",
-    )
-    backend_options = (
-        ["API (FastAPI)"]
-        if os.getenv("RAG_ALLOW_INLINE_DEMO", "true").strip().lower() != "true"
-        else ["API (FastAPI)", "Inline demo"]
-    )
-    backend = st.radio(
-        "Backend",
-        backend_options,
-        help="API mode keeps indexed papers in the persistent vector database. Inline demo is temporary and uses synthetic content.",
-    )
-    search_mode = st.radio(
-        "Search in",
-        ["Indexed papers", "Web search"],
-        horizontal=True,
-        help="Web search sends the question to Tavily only after you select this option and submit it.",
-    )
+    inline_only = os.getenv("RAG_INLINE_ONLY", "false").strip().lower() == "true"
+    if inline_only:
+        api_url = ""
+        backend = "Inline demo"
+        search_mode = "Indexed papers"
+        st.caption("Free demo mode · papers are kept in this running session only")
+    else:
+        api_url = st.text_input(
+            "API base URL",
+            value=os.getenv("RAG_API_URL", "http://localhost:8000"),
+            help="URL of the FastAPI backend",
+            disabled=os.getenv("RAG_LOCK_API_URL", "false").strip().lower() == "true",
+        )
+        backend_options = (
+            ["API (FastAPI)"]
+            if os.getenv("RAG_ALLOW_INLINE_DEMO", "true").strip().lower() != "true"
+            else ["API (FastAPI)", "Inline demo"]
+        )
+        default_backend = os.getenv("RAG_DEFAULT_BACKEND", backend_options[0])
+        if default_backend not in backend_options:
+            default_backend = backend_options[0]
+        backend = st.radio(
+            "Backend",
+            backend_options,
+            index=backend_options.index(default_backend),
+            help="API mode keeps indexed papers in the persistent vector database. Inline demo is temporary and uses synthetic content.",
+        )
+        search_mode = st.radio(
+            "Search in",
+            ["Indexed papers", "Web search"],
+            horizontal=True,
+            help="Web search sends the question to Tavily only after you select this option and submit it.",
+        )
     top_k = st.slider("Retrieved paper chunks", min_value=1, max_value=10, value=5)
     show_violations = st.checkbox("Show citation checks", value=False)
     st.divider()

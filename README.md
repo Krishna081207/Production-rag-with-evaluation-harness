@@ -131,6 +131,12 @@ docker compose up --build
 
 Compose persists the local Qdrant database and corpus in the `rag_data` volume. For a shared or multi-replica deployment, configure a remote Qdrant service or Pinecone. Put the API and UI behind your organization’s access control and TLS before exposing them beyond a trusted network; the admin key protects ingestion, while query access is otherwise open.
 
+## Free demo deployment (Streamlit Community Cloud)
+
+For a no-cost demo, deploy `rag_hybrid/scripts/app_streamlit_cloud.py` from the `main` branch of this public GitHub repository at [Streamlit Community Cloud](https://share.streamlit.io/). It runs the Streamlit UI and RAG pipeline in one process, so it does not need the paid Render API service or persistent disk. `requirements.txt` contains the smaller dependency set for this entry point. Streamlit Community Cloud is free, but apps hibernate after 12 hours without traffic and have limited resources ([limits and hibernation](https://docs.streamlit.io/deploy/streamlit-community-cloud/manage-your-app)).
+
+Choose Python 3.12 in Advanced settings. To enable generated answers, add `GROQ_API_KEY` and optionally `GROQ_MODEL` in Streamlit's Secrets settings; never commit these values. Upload papers after launch. The free demo keeps its Qdrant index in memory, so uploaded papers disappear when the app restarts or wakes after hibernation. This deployment is suitable for trying the app, not for a durable shared research library. It disables Web search and the separate FastAPI backend. For persisted papers and a private API, use the paid Render Blueprint above.
+
 ## Production deployment (Render)
 
 The included [`render.yaml`](render.yaml) creates two services in Singapore: a public Streamlit web service and a private FastAPI service. The API stores Qdrant, the BM25 corpus, and the embedding-model cache on a 10 GB persistent disk. Only the Streamlit service is reachable from the public internet. The UI requires Streamlit OIDC sign-in and an explicit email allowlist before it exposes any RAG features; until those values are configured, it shows a locked setup page. Streamlit OIDC supports providers such as Google, Microsoft Entra ID, Okta, and Auth0 ([Streamlit authentication](https://docs.streamlit.io/develop/concepts/connections/authentication)).
