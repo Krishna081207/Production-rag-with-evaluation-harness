@@ -1,0 +1,34 @@
+FROM python:3.11-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    RAG_DATA_DIR=/app/data \
+    QDRANT_PATH=/app/data/qdrant \
+    HF_HOME=/app/data/huggingface \
+    HF_HUB_DISABLE_TELEMETRY=1
+
+WORKDIR /app
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends build-essential \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --system raguser \
+    && useradd --system --gid raguser --create-home raguser
+
+COPY pyproject.toml README.md ./
+COPY rag_hybrid/ ./rag_hybrid/
+COPY deploy/api_entrypoint.py /app/deploy/api_entrypoint.py
+
+RUN pip install --no-cache-dir --upgrade pip \
+    && pip install --no-cache-dir ".[pinecone]" \
+    && mkdir -p /app/data \
+    && chown -R raguser:raguser /app/data
+
+EXPOSE 10000
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=300s --retries=3 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:10000/health', timeout=3)" || exit 1
+
+ENTRYPOINT ["python", "/app/deploy/api_entrypoint.py"]
+CMD ["uvicorn", "rag_hybrid.src.api.app:app", "--host", "0.0.0.0", "--port", "10000"]

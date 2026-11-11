@@ -1,0 +1,32 @@
+FROM python:3.11-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    STREAMLIT_BROWSER_GATHER_USAGE_STATS=false
+
+WORKDIR /app
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends build-essential \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --system raguser \
+    && useradd --system --gid raguser --create-home raguser
+
+COPY pyproject.toml README.md ./
+COPY rag_hybrid/ ./rag_hybrid/
+COPY deploy/render_streamlit_entrypoint.py /app/deploy/render_streamlit_entrypoint.py
+
+RUN pip install --no-cache-dir --upgrade pip \
+    && pip install --no-cache-dir ".[pinecone]" \
+    && mkdir -p /home/raguser/.streamlit \
+    && chown -R raguser:raguser /home/raguser/.streamlit
+
+USER raguser
+
+EXPOSE 10000
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:10000/_stcore/health', timeout=3)" || exit 1
+
+CMD ["python", "/app/deploy/render_streamlit_entrypoint.py"]

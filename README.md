@@ -131,6 +131,19 @@ docker compose up --build
 
 Compose persists the local Qdrant database and corpus in the `rag_data` volume. For a shared or multi-replica deployment, configure a remote Qdrant service or Pinecone. Put the API and UI behind your organization’s access control and TLS before exposing them beyond a trusted network; the admin key protects ingestion, while query access is otherwise open.
 
+## Production deployment (Render)
+
+The included [`render.yaml`](render.yaml) creates two services in Singapore: a public Streamlit web service and a private FastAPI service. The API stores Qdrant, the BM25 corpus, and the embedding-model cache on a 10 GB persistent disk. Only the Streamlit service is reachable from the public internet. The UI requires Streamlit OIDC sign-in and an explicit email allowlist before it exposes any RAG features; until those values are configured, it shows a locked setup page. Streamlit OIDC supports providers such as Google, Microsoft Entra ID, Okta, and Auth0 ([Streamlit authentication](https://docs.streamlit.io/develop/concepts/connections/authentication)).
+
+Create a Render Blueprint from this repository and deploy `render.yaml`. Render persistent disks require a paid service plan ([persistent disk limits](https://render.com/docs/disks)). After the first deploy:
+
+1. Copy the Streamlit service URL from Render. In your identity provider, register `https://<your-streamlit-host>/oauth2callback` as an allowed redirect URI. For a custom domain, use the custom-domain callback URI and set `OIDC_REDIRECT_URI` on the Streamlit service to that exact URL.
+2. On the Streamlit service, set `OIDC_CLIENT_ID`, `OIDC_CLIENT_SECRET`, and `AUTHORIZED_EMAILS`. Enter authorized email addresses as a comma-separated list. The Blueprint generates `OIDC_COOKIE_SECRET` and the API's `ADMIN_API_KEY` for you. Google is the default identity provider; set `OIDC_SERVER_METADATA_URL` on the Streamlit service for another OIDC provider.
+3. Set `GROQ_API_KEY` and `TAVILY_API_KEY` on the private API service if you want generated answers and web search. Without them, paper queries use the cited extractive fallback and web search is unavailable.
+4. Redeploy the Streamlit service after setting authentication values, then upload your papers through the app. Local Qdrant and paper data are not copied by deployment; the new hosted library starts empty.
+
+Every allowlisted account uses the same paper library. This layout runs one API instance because Render disks cannot be shared or horizontally scaled; the disk provides persistence and daily snapshots, but does not provide high availability or a database backup strategy ([disk behavior](https://render.com/docs/disks), [scaling limits](https://render.com/docs/blueprint-spec#scaling)). For larger or higher-availability production use, move vectors to a managed Qdrant cluster and move the BM25 corpus to shared durable storage before scaling the API. Review the service plan and disk costs in Render before creating the Blueprint.
+
 ## Configuration
 
 | Variable | Purpose | Default |

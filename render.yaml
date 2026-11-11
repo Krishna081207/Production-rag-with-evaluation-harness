@@ -1,0 +1,66 @@
+services:
+  - type: pserv
+    name: research-paper-api
+    runtime: docker
+    plan: 2c-4g
+    region: singapore
+    dockerfilePath: ./Dockerfile.api
+    dockerContext: .
+    healthCheckPath: /health
+    disk:
+      name: research-paper-data
+      mountPath: /app/data
+      sizeGB: 10
+    envVars:
+      - key: PORT
+        value: "10000"
+      - key: VECTOR_DB
+        value: qdrant
+      - key: QDRANT_PATH
+        value: /app/data/qdrant
+      - key: QDRANT_COLLECTION_NAME
+        value: rag-hybrid
+      - key: RAG_DATA_DIR
+        value: /app/data
+      - key: EMBEDDING_MODEL
+        value: BAAI/bge-small-en-v1.5
+      - key: RERANKER_MODEL
+        value: cross-encoder/ms-marco-MiniLM-L-6-v2
+      - key: GROQ_MODEL
+        value: openai/gpt-oss-20b
+      - key: ADMIN_API_KEY
+        generateValue: true
+      - key: MAX_UPLOAD_BYTES
+        value: "10485760"
+
+  - type: web
+    name: research-paper-assistant
+    runtime: docker
+    plan: 1c-2g
+    region: singapore
+    dockerfilePath: ./Dockerfile.streamlit
+    dockerContext: .
+    healthCheckPath: /_stcore/health
+    envVars:
+      - key: PORT
+        value: "10000"
+      - key: RAG_API_HOSTPORT
+        fromService:
+          type: pserv
+          name: research-paper-api
+          property: hostport
+      - key: ADMIN_API_KEY
+        fromService:
+          type: pserv
+          name: research-paper-api
+          envVarKey: ADMIN_API_KEY
+      - key: AUTH_REQUIRED
+        value: "true"
+      - key: OIDC_COOKIE_SECRET
+        generateValue: true
+      - key: OIDC_SERVER_METADATA_URL
+        value: https://accounts.google.com/.well-known/openid-configuration
+      - key: RAG_LOCK_API_URL
+        value: "true"
+      - key: RAG_ALLOW_INLINE_DEMO
+        value: "false"

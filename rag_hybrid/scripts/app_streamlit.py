@@ -50,6 +50,44 @@ st.markdown(
 )
 
 
+def require_authenticated_user() -> None:
+    """Require a configured OIDC login and an explicitly allowed email in production."""
+    if os.getenv("AUTH_REQUIRED", "false").strip().lower() != "true":
+        return
+
+    if os.getenv("RAG_OIDC_CONFIGURED") != "true":
+        st.title("Research Paper Assistant")
+        st.error(
+            "Sign-in is not configured yet. Set the OIDC client credentials and "
+            "AUTHORIZED_EMAILS on the hosting service to unlock this workspace."
+        )
+        st.stop()
+
+    if not st.user.is_logged_in:
+        st.title("Research Paper Assistant")
+        st.write("Sign in with your organization's identity provider to continue.")
+        st.button("Sign in", on_click=st.login, type="primary")
+        st.stop()
+
+    user_email = str(getattr(st.user, "email", "") or "").strip().casefold()
+    allowed_emails = {
+        email.strip().casefold()
+        for email in os.getenv("AUTHORIZED_EMAILS", "").split(",")
+        if email.strip()
+    }
+    if not user_email or user_email not in allowed_emails:
+        st.title("Research Paper Assistant")
+        st.error("Your account is not on this workspace's access list.")
+        st.button("Sign out", on_click=st.logout)
+        st.stop()
+
+    st.sidebar.caption(f"Signed in as {user_email}")
+    st.sidebar.button("Sign out", on_click=st.logout)
+
+
+require_authenticated_user()
+
+
 def _raise_for_api_error(response: requests.Response) -> None:
     try:
         response.raise_for_status()
@@ -331,10 +369,16 @@ with st.sidebar:
         "API base URL",
         value=os.getenv("RAG_API_URL", "http://localhost:8000"),
         help="URL of the FastAPI backend",
+        disabled=os.getenv("RAG_LOCK_API_URL", "false").strip().lower() == "true",
+    )
+    backend_options = (
+        ["API (FastAPI)"]
+        if os.getenv("RAG_ALLOW_INLINE_DEMO", "true").strip().lower() != "true"
+        else ["API (FastAPI)", "Inline demo"]
     )
     backend = st.radio(
         "Backend",
-        ["API (FastAPI)", "Inline demo"],
+        backend_options,
         help="API mode keeps indexed papers in the persistent vector database. Inline demo is temporary and uses synthetic content.",
     )
     search_mode = st.radio(
