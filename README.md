@@ -2,6 +2,8 @@
 
 A paper-reading assistant built on hybrid retrieval and an evaluation harness. Upload a research paper, ask about its research question, contributions, methods, results, or limitations, and inspect the retrieved source and PDF page behind each answer.
 
+**Live app:** [Open the Research Paper Assistant](https://research-paper-assistant-rag.streamlit.app/)
+
 The project combines dense retrieval, BM25, reciprocal rank fusion, cross-encoder reranking, cited answer generation, and NLI-based evidence checks. The included evaluation data is synthetic smoke data; it demonstrates the harness and does not measure research-paper answer quality.
 
 ## How it works
