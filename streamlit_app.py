@@ -1,6 +1,7 @@
 """Root Streamlit Community Cloud entry point for the research paper demo."""
 
 import os
+import runpy
 import sys
 from pathlib import Path
 
@@ -11,4 +12,7 @@ if REPOSITORY_ROOT not in sys.path:
 os.environ["RAG_INLINE_ONLY"] = "true"
 os.environ.setdefault("RAG_INLINE_RETRIEVAL_MODE", "hybrid")
 
-from rag_hybrid.scripts import app_streamlit  # noqa: E402,F401
+runpy.run_path(
+    str(Path(REPOSITORY_ROOT) / "rag_hybrid" / "scripts" / "app_streamlit.py"),
+    run_name="__main__",
+)
