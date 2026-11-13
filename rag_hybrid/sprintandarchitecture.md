@@ -37,8 +37,8 @@ flowchart TD
 | Sparse retrieval | BM25 over the same child chunks, restored from an atomic JSONL corpus snapshot. |
 | Fusion | Reciprocal Rank Fusion with `k=60`. |
 | Reranking | `cross-encoder/ms-marco-MiniLM-L-6-v2` scores the fused candidate set. |
-| Generation | Groq model configured with `GROQ_MODEL`; defaults to `openai/gpt-oss-20b`. Without a Groq key or on generation failure, the first sentence from the top parent chunk is returned with a citation. |
-| Citation checks | Every generated factual sentence must have a retrieved chunk citation. Unsupported or invalid citations fall back to an extractive answer. |
+| Generation | Groq model configured with `GROQ_MODEL`; defaults to `openai/gpt-oss-20b`. Supported models receive a strict structured-output schema that limits each claim citation to a retrieved chunk ID. Without a Groq key or on generation failure, query-relevant child sentences are returned with citations. |
+| Citation checks | Every generated factual sentence must have a retrieved chunk citation. Unsupported or invalid citations fall back to a visible extractive answer. |
 | Evidence scoring | `cross-encoder/nli-deberta-v3-small` estimates entailment between each claim and its cited parent text. Empty answers have no score. |
 | API and UI | FastAPI for query/ingestion and Streamlit for upload, questions, citations, and evidence status. |
 | Storage | Qdrant can use memory, a local path, or a remote URL. The API persists BM25 chunks as JSONL. Docker Compose uses a named volume. |

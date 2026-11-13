@@ -22,9 +22,9 @@ def read_document_segments(filename: str, content: bytes) -> tuple[str, list[tup
 
     if suffix == ".pdf":
         try:
-            import fitz
+            import pymupdf
 
-            with fitz.open(stream=content, filetype="pdf") as document:
+            with pymupdf.open(stream=content, filetype="pdf") as document:
                 if document.is_encrypted:
                     raise ValueError("Encrypted PDF files are not supported")
                 segments = [

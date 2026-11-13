@@ -305,14 +305,16 @@ def render_assistant_message(message: dict[str, Any], show_violations: bool) -> 
 
     if result.get("answer_mode") == "extractive":
         if os.getenv("GROQ_API_KEY") or os.getenv("groq"):
-            st.info("Answer synthesis failed. The retrieved paper passages are shown below.")
+            st.info(
+                "I couldn't produce a validated model answer, so this cited answer is selected "
+                "from the retrieved paper text."
+            )
         else:
             st.info(
-                "No answer-generation model is configured. The retrieved passages below show "
-                "the paper content that matched your question. Set GROQ_API_KEY for a plain-language answer."
+                "No answer-generation model is configured. This cited answer is selected from "
+                "the paper text that matched your question. Set GROQ_API_KEY for a generated answer."
             )
-    else:
-        st.markdown(result.get("answer", "No answer returned."))
+    st.markdown(result.get("answer", "No answer returned."))
     if message.get("source_mode") == "Web search":
         sources = result.get("sources", [])
         st.caption(f"Web search · {len(sources)} source(s) · {message['elapsed']:.2f}s")
