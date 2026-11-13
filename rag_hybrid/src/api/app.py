@@ -59,6 +59,7 @@ class QueryResponse(BaseModel):
     retrieved_sources: list[dict[str, str | int | None]]
     faithfulness_score: float | None
     violations: list[str] | None = None
+    fallback_reason: str | None = None
     latency_ms: dict[str, float]
 
 
@@ -424,6 +425,7 @@ async def query_endpoint(req: QueryRequest) -> QueryResponse:
         ],
         faithfulness_score=evaluation.faithfulness_score if evaluation else None,
         violations=evaluation.violations or None if evaluation else None,
+        fallback_reason=generation.fallback_reason,
         latency_ms={
             "retrieval": round(retrieval_ms, 1),
             "generation": round(generation_ms, 1),

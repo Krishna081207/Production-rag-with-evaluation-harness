@@ -258,6 +258,7 @@ def call_inline(query: str, top_k: int) -> dict[str, Any]:
         ],
         "faithfulness_score": evaluation.faithfulness_score if evaluation else None,
         "violations": evaluation.violations or None if evaluation else None,
+        "fallback_reason": generation.fallback_reason,
         "latency_ms": {},
         "retrieved_sources": [
             {
@@ -304,15 +305,28 @@ def render_assistant_message(message: dict[str, Any], show_violations: bool) -> 
         return
 
     if result.get("answer_mode") == "extractive":
-        if os.getenv("GROQ_API_KEY") or os.getenv("groq"):
+        fallback_reason = result.get("fallback_reason")
+        if fallback_reason == "provider_error":
             st.info(
-                "I couldn't produce a validated model answer, so this cited answer is selected "
-                "from the retrieved paper text."
+                "Groq couldn't complete the answer request. Showing a cited answer from the "
+                "retrieved paper text. Check the Streamlit app logs for the provider error."
             )
-        else:
+        elif fallback_reason == "citation_validation_error":
+            st.info(
+                "Groq's answer still lacked valid citations after a retry. Showing a cited "
+                "answer selected from the retrieved paper text."
+            )
+        elif fallback_reason == "no_api_key" or not (
+            os.getenv("GROQ_API_KEY") or os.getenv("groq")
+        ):
             st.info(
                 "No answer-generation model is configured. This cited answer is selected from "
                 "the paper text that matched your question. Set GROQ_API_KEY for a generated answer."
+            )
+        else:
+            st.info(
+                "A validated model answer wasn't available. Showing a cited answer selected "
+                "from the retrieved paper text. Check the Streamlit app logs for details."
             )
     st.markdown(result.get("answer", "No answer returned."))
     if message.get("source_mode") == "Web search":

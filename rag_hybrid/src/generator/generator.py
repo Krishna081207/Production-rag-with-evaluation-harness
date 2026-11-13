@@ -38,6 +38,7 @@ class GenerationResult(BaseModel):
     answer: str
     citations: list[str]
     mode: Literal["generated", "extractive", "abstention"] = "generated"
+    fallback_reason: Literal["no_api_key", "provider_error", "citation_validation_error"] | None = None
 
 
 def _sentences(text: str) -> list[str]:
@@ -86,11 +87,18 @@ def _format_cited_sentence(sentence: str, chunk_id: str) -> str:
 
 
 def _extractive_fallback(
-    retrieved_chunks: list[DocumentChunk], query: str = ""
+    retrieved_chunks: list[DocumentChunk],
+    query: str = "",
+    *,
+    fallback_reason: Literal[
+        "no_api_key", "provider_error", "citation_validation_error"
+    ] | None = None,
 ) -> GenerationResult:
     """Return several query-relevant, cited sentences from retrieved child chunks."""
     if not retrieved_chunks:
-        return GenerationResult(answer=ABSTENTION, citations=[], mode="abstention")
+        return GenerationResult(
+            answer=ABSTENTION, citations=[], mode="abstention", fallback_reason=fallback_reason
+        )
 
     terms = _query_terms(query)
     candidates: list[tuple[int, int, int, str, DocumentChunk]] = []
@@ -106,7 +114,9 @@ def _extractive_fallback(
             candidates.append((score, -rank, -sentence_index, sentence, chunk))
 
     if not candidates:
-        return GenerationResult(answer=ABSTENTION, citations=[], mode="abstention")
+        return GenerationResult(
+            answer=ABSTENTION, citations=[], mode="abstention", fallback_reason=fallback_reason
+        )
 
     ranked = sorted(candidates, key=lambda item: item[:3], reverse=True)
     if terms and ranked[0][0] > 0:
@@ -133,7 +143,12 @@ def _extractive_fallback(
         for _, _, _, sentence, chunk in selected
     )
     citations = list(dict.fromkeys(f"Chunk_{chunk.chunk_id}" for _, _, _, _, chunk in selected))
-    return GenerationResult(answer=answer, citations=citations, mode="extractive")
+    return GenerationResult(
+        answer=answer,
+        citations=citations,
+        mode="extractive",
+        fallback_reason=fallback_reason,
+    )
 
 
 def extract_claims(answer: str) -> list[dict[str, str]]:
@@ -311,49 +326,127 @@ def generate_answer(query: str, retrieved_chunks: list[DocumentChunk]) -> Genera
 
     api_key = os.getenv("GROQ_API_KEY") or os.getenv("groq")
     if not api_key:
-        return _extractive_fallback(retrieved_chunks, query)
+        return _extractive_fallback(retrieved_chunks, query, fallback_reason="no_api_key")
 
     valid_ids = {f"Chunk_{chunk.chunk_id}" for chunk in retrieved_chunks}
     model = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b").strip()
     use_structured_output = model in _STRUCTURED_OUTPUT_MODELS
     try:
         client = Groq(api_key=api_key)
+    except Exception as exc:
+        logger.warning(
+            "Groq client initialization failed; fallback_reason=provider_error error_type=%s",
+            type(exc).__name__,
+        )
+        return _extractive_fallback(
+            retrieved_chunks, query, fallback_reason="provider_error"
+        )
+
+    def request_answer(structured_output: bool, citation_retry: bool = False) -> str:
+        prompt = _build_prompt(
+            query, retrieved_chunks, structured_output=structured_output
+        )
+        if citation_retry:
+            example_citation = sorted(valid_ids)[0]
+            prompt += (
+                "\n\nCorrection: the previous answer failed citation validation. Answer again. "
+                f"Use only these exact citation IDs: {', '.join(sorted(valid_ids))}. "
+                "Put a valid citation in every factual sentence, immediately before its final "
+                f"punctuation; for example, 'The authors report this result [{example_citation}].' "
+                "Do not include any factual sentence without a citation."
+            )
         request = {
             "model": model,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": _build_prompt(
-                        query, retrieved_chunks, structured_output=use_structured_output
-                    ),
-                }
-            ],
+            "messages": [{"role": "user", "content": prompt}],
             "temperature": 0.2,
             "max_completion_tokens": 1024,
         }
-        if use_structured_output:
+        if structured_output:
             request["response_format"] = _citation_response_format(valid_ids)
         response = client.chat.completions.create(
             **request,
         )
-        answer_text = (response.choices[0].message.content or "").strip()
+        return (response.choices[0].message.content or "").strip()
+
+    retried_plain = False
+    try:
+        answer_text = request_answer(use_structured_output)
     except Exception as exc:
-        logger.warning("Groq generation failed; using cited extractive fallback: %s", exc)
-        return _extractive_fallback(retrieved_chunks, query)
+        status_code = getattr(exc, "status_code", None)
+        if not use_structured_output or status_code in {401, 403, 404, 429}:
+            logger.warning(
+                "Groq generation failed; fallback_reason=provider_error status=%s error_type=%s",
+                status_code,
+                type(exc).__name__,
+            )
+            return _extractive_fallback(
+                retrieved_chunks, query, fallback_reason="provider_error"
+            )
+        logger.warning(
+            "Groq structured generation failed; retrying plain cited generation "
+            "status=%s error_type=%s",
+            status_code,
+            type(exc).__name__,
+        )
+        try:
+            answer_text = request_answer(structured_output=False, citation_retry=True)
+            use_structured_output = False
+            retried_plain = True
+        except Exception as retry_exc:
+            logger.warning(
+                "Groq generation retry failed; fallback_reason=provider_error "
+                "status=%s error_type=%s",
+                getattr(retry_exc, "status_code", None),
+                type(retry_exc).__name__,
+            )
+            return _extractive_fallback(
+                retrieved_chunks, query, fallback_reason="provider_error"
+            )
 
     if use_structured_output:
         structured_result = _parse_structured_answer(answer_text, valid_ids)
         if structured_result is not None:
             return structured_result
-        # Accept a correctly cited plain-text response for SDK mocks or gateways that
-        # ignore response_format, but do not display malformed structured JSON.
-        if answer_text.lstrip().startswith("{"):
-            logger.warning("Generated structured answer failed validation; using extractive fallback")
-            return _extractive_fallback(retrieved_chunks, query)
+        logger.warning("Structured answer was unusable; retrying plain cited generation")
+        try:
+            answer_text = request_answer(structured_output=False, citation_retry=True)
+            use_structured_output = False
+            retried_plain = True
+        except Exception as exc:
+            logger.warning(
+                "Groq plain generation retry failed; fallback_reason=provider_error "
+                "status=%s error_type=%s",
+                getattr(exc, "status_code", None),
+                type(exc).__name__,
+            )
+            return _extractive_fallback(
+                retrieved_chunks, query, fallback_reason="provider_error"
+            )
+
+    if not _has_only_valid_citations(answer_text, valid_ids) and not retried_plain:
+        logger.warning("Generated answer had missing or invalid citations; retrying with citation guidance")
+        try:
+            answer_text = request_answer(structured_output=False, citation_retry=True)
+            use_structured_output = False
+            retried_plain = True
+        except Exception as exc:
+            logger.warning(
+                "Groq citation retry failed; fallback_reason=provider_error status=%s error_type=%s",
+                getattr(exc, "status_code", None),
+                type(exc).__name__,
+            )
+            return _extractive_fallback(
+                retrieved_chunks, query, fallback_reason="provider_error"
+            )
 
     if not _has_only_valid_citations(answer_text, valid_ids):
-        logger.warning("Generated answer had missing or invalid citations; using extractive fallback")
-        return _extractive_fallback(retrieved_chunks, query)
+        logger.warning(
+            "Generated answer had missing or invalid citations after retry; "
+            "fallback_reason=citation_validation_error"
+        )
+        return _extractive_fallback(
+            retrieved_chunks, query, fallback_reason="citation_validation_error"
+        )
 
     citations = list(dict.fromkeys(f"Chunk_{value}" for value in CITATION_RE.findall(answer_text)))
     return GenerationResult(answer=answer_text or ABSTENTION, citations=citations, mode="generated")
