@@ -225,7 +225,10 @@ def _load_inline_pipeline():
 def call_inline(query: str, top_k: int) -> dict[str, Any]:
     rag, evaluator, generate_answer, extract_claims = _load_inline_pipeline()
     st.session_state.inline_pipeline_loaded = True
-    retrieved = rag.hybrid_retrieve(query, top_candidates=10, final_k=top_k)
+    retrieval_mode = os.getenv("RAG_INLINE_RETRIEVAL_MODE", "hybrid_rerank")
+    retrieved = rag.hybrid_retrieve(
+        query, top_candidates=10, final_k=top_k, mode=retrieval_mode
+    )
     generation = generate_answer(query, retrieved)
     retrieved_map = {
         key: chunk.text

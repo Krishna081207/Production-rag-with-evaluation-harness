@@ -5,6 +5,7 @@ import sys
 from pathlib import Path
 
 os.environ["RAG_INLINE_ONLY"] = "true"
+os.environ.setdefault("RAG_INLINE_RETRIEVAL_MODE", "hybrid")
 
 # Streamlit Cloud can start a nested entry point with only its script directory
 # on sys.path. Add the repository root so the rag_hybrid package is importable.
