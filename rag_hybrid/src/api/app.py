@@ -425,7 +425,7 @@ async def query_endpoint(req: QueryRequest) -> QueryResponse:
         ],
         faithfulness_score=evaluation.faithfulness_score if evaluation else None,
         violations=evaluation.violations or None if evaluation else None,
-        fallback_reason=generation.fallback_reason,
+        fallback_reason=getattr(generation, "fallback_reason", None),
         latency_ms={
             "retrieval": round(retrieval_ms, 1),
             "generation": round(generation_ms, 1),

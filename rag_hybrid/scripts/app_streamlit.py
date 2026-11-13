@@ -12,6 +12,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 API_START_COMMAND = "python -m rag_hybrid.scripts.run_local"
+INLINE_PIPELINE_CACHE_VERSION = "generation-result-v2"
 
 for secret_name in ("GROQ_API_KEY", "GROQ_MODEL"):
     if not os.getenv(secret_name):
@@ -172,14 +173,14 @@ def upload_documents(base_url: str, files: list) -> dict[str, Any]:
 
 
 @st.cache_resource(show_spinner="Loading local models…")
-def _load_inline_pipeline():
-    """Load the RAG components once and cache them."""
-    from importlib import import_module
+def _load_inline_pipeline(cache_version: str):
+    """Load the RAG components once; cache_version invalidates stale deployed resources."""
+    from importlib import import_module, reload
 
     FaithfulnessEvaluator = import_module(
         "rag_hybrid.src.eval.faithfulness"
     ).FaithfulnessEvaluator
-    generator = import_module("rag_hybrid.src.generator.generator")
+    generator = reload(import_module("rag_hybrid.src.generator.generator"))
     extract_claims = generator.extract_claims
     generate_answer = generator.generate_answer
     retriever = import_module("rag_hybrid.src.retriever.hybrid")
@@ -223,7 +224,9 @@ def _load_inline_pipeline():
 
 
 def call_inline(query: str, top_k: int) -> dict[str, Any]:
-    rag, evaluator, generate_answer, extract_claims = _load_inline_pipeline()
+    rag, evaluator, generate_answer, extract_claims = _load_inline_pipeline(
+        INLINE_PIPELINE_CACHE_VERSION
+    )
     st.session_state.inline_pipeline_loaded = True
     retrieval_mode = os.getenv("RAG_INLINE_RETRIEVAL_MODE", "hybrid_rerank")
     retrieved = rag.hybrid_retrieve(
@@ -258,7 +261,7 @@ def call_inline(query: str, top_k: int) -> dict[str, Any]:
         ],
         "faithfulness_score": evaluation.faithfulness_score if evaluation else None,
         "violations": evaluation.violations or None if evaluation else None,
-        "fallback_reason": generation.fallback_reason,
+        "fallback_reason": getattr(generation, "fallback_reason", None),
         "latency_ms": {},
         "retrieved_sources": [
             {
@@ -280,7 +283,7 @@ def index_inline_documents(files: list) -> dict[str, Any]:
     chunk_document_segments = ingestion.chunk_document_segments
     read_document_segments = ingestion.read_document_segments
 
-    rag, _, _, _ = _load_inline_pipeline()
+    rag, _, _, _ = _load_inline_pipeline(INLINE_PIPELINE_CACHE_VERSION)
     st.session_state.inline_pipeline_loaded = True
     chunks = []
     names = []
@@ -498,7 +501,7 @@ with st.sidebar:
             st.warning("FastAPI is unavailable. Start the local services to view and upload your library.")
             st.code(API_START_COMMAND, language="powershell")
     elif st.session_state.get("inline_pipeline_loaded"):
-        inline_rag, _, _, _ = _load_inline_pipeline()
+        inline_rag, _, _, _ = _load_inline_pipeline(INLINE_PIPELINE_CACHE_VERSION)
         inline_counts: dict[str, int] = {}
         for chunk in inline_rag.corpus_chunks:
             source_name = chunk.source_name or chunk.doc_id
