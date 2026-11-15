@@ -7,6 +7,7 @@ import os
 import threading
 import time
 from pathlib import Path
+from typing import Literal
 
 from fastapi import FastAPI, File, Header, HTTPException, UploadFile
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -15,12 +16,13 @@ from starlette.concurrency import run_in_threadpool
 from rag_hybrid.src.config import max_upload_bytes
 from rag_hybrid.src.corpus_store import load_corpus, save_corpus
 from rag_hybrid.src.eval.faithfulness import FaithfulnessEvaluator
-from rag_hybrid.src.generator.generator import extract_claims, generate_answer
+from rag_hybrid.src.generator.generator import extract_claims
 from rag_hybrid.src.ingestion import (
     SUPPORTED_EXTENSIONS,
     chunk_document_segments,
     read_document_segments,
 )
+from rag_hybrid.src.paper_qa import PaperQA
 from rag_hybrid.src.retriever.hybrid import DocumentChunk, ProductionHybridRAG
 from rag_hybrid.src.web_search import (
     WebSearchConfigurationError,
@@ -32,6 +34,7 @@ logger = logging.getLogger(__name__)
 app = FastAPI(title="Research Paper Understanding RAG", version="0.2.0")
 
 _rag: ProductionHybridRAG | None = None
+_paper_qa: PaperQA | None = None
 _evaluator: FaithfulnessEvaluator | None = None
 _initialization_lock = threading.RLock()
 _model_warmup_status = "pending"
@@ -61,6 +64,7 @@ class QueryResponse(BaseModel):
     violations: list[str] | None = None
     fallback_reason: str | None = None
     latency_ms: dict[str, float]
+    cache_status: Literal["miss", "hit", "shared"]
 
 
 class UploadResponse(BaseModel):
@@ -196,12 +200,26 @@ def _evaluate_claims(
     claims: list[dict[str, str]], retrieved_map: dict[str, str]
 ):
     """Initialize and run the NLI model off the async event loop."""
-    return _get_evaluator().evaluate_generation(claims, retrieved_map)
+    try:
+        return _get_evaluator().evaluate_generation(claims, retrieved_map)
+    except Exception:
+        logger.exception("Could not run citation checks for the generated answer")
+        return None
 
 
 def _extract_claims(answer: str) -> list[dict[str, str]]:
     """Create one verifiable claim per sentence and cited chunk ID."""
     return extract_claims(answer)
+
+
+def _query_papers(query: str, top_k: int) -> dict:
+    global _paper_qa
+    rag = _get_rag()
+    with _initialization_lock:
+        if _paper_qa is None or _paper_qa.rag is not rag:
+            _paper_qa = PaperQA(rag, _evaluate_claims)
+        paper_qa = _paper_qa
+    return paper_qa.answer(query, top_k)
 
 
 def _safe_filename(filename: str) -> str:
@@ -360,76 +378,11 @@ async def web_search_endpoint(req: QueryRequest) -> WebSearchResponse:
 
 @app.post("/query", response_model=QueryResponse)
 async def query_endpoint(req: QueryRequest) -> QueryResponse:
-    total_started = time.perf_counter()
+    started = time.perf_counter()
     try:
-        retrieval_started = time.perf_counter()
-        rag = await run_in_threadpool(_get_rag)
-        retrieved_chunks = await run_in_threadpool(
-            rag.hybrid_retrieve,
-            req.query,
-            top_candidates=max(10, req.top_k * 2),
-            final_k=req.top_k,
-        )
-        retrieval_ms = (time.perf_counter() - retrieval_started) * 1000
-
-        generation_started = time.perf_counter()
-        generation = await run_in_threadpool(generate_answer, req.query, retrieved_chunks)
-        generation_ms = (time.perf_counter() - generation_started) * 1000
-
-        evaluation_started = time.perf_counter()
-        claims = _extract_claims(generation.answer) if generation.mode == "generated" else []
-        retrieved_map = {
-            key: chunk.text
-            for chunk in retrieved_chunks
-            for key in (chunk.chunk_id, f"Chunk_{chunk.chunk_id}")
-        }
-        if claims:
-            evaluation = await run_in_threadpool(
-                _evaluate_claims,
-                claims,
-                retrieved_map,
-            )
-        else:
-            evaluation = None
-        evaluation_ms = (time.perf_counter() - evaluation_started) * 1000
+        result = await run_in_threadpool(_query_papers, req.query, req.top_k)
     except Exception as exc:
         logger.exception("RAG query failed")
         raise HTTPException(status_code=503, detail="The RAG service could not complete the query") from exc
-
-    chunks_by_citation = {f"Chunk_{chunk.chunk_id}": chunk for chunk in retrieved_chunks}
-    citation_details = []
-    for citation in generation.citations:
-        chunk = chunks_by_citation.get(citation)
-        if chunk:
-            citation_details.append(
-                {
-                    "citation": citation,
-                    "source_name": chunk.source_name or chunk.doc_id,
-                    "page_number": chunk.page_number,
-                }
-            )
-
-    return QueryResponse(
-        answer=generation.answer,
-        answer_mode=generation.mode,
-        citations=generation.citations,
-        citation_details=citation_details,
-        retrieved_sources=[
-            {
-                "citation": f"Chunk_{chunk.chunk_id}",
-                "source_name": chunk.source_name or chunk.doc_id,
-                "page_number": chunk.page_number,
-                "excerpt": chunk.text,
-            }
-            for chunk in retrieved_chunks
-        ],
-        faithfulness_score=evaluation.faithfulness_score if evaluation else None,
-        violations=evaluation.violations or None if evaluation else None,
-        fallback_reason=getattr(generation, "fallback_reason", None),
-        latency_ms={
-            "retrieval": round(retrieval_ms, 1),
-            "generation": round(generation_ms, 1),
-            "evidence_check": round(evaluation_ms, 1),
-            "total": round((time.perf_counter() - total_started) * 1000, 1),
-        },
-    )
+    result["latency_ms"]["total"] = round((time.perf_counter() - started) * 1000, 2)
+    return QueryResponse(**result)

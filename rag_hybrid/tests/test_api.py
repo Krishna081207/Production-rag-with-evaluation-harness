@@ -117,15 +117,19 @@ class TestQueryEndpoint:
     @patch("rag_hybrid.src.api.app._rag")
     @patch("rag_hybrid.src.api.app._evaluator")
     @patch("rag_hybrid.src.generator.generator.Groq")
-    def test_successful_query(self, MockGroq, mock_eval, mock_rag, client):
+    def test_successful_query(self, MockGroq, mock_eval, mock_rag, client, monkeypatch):
         from rag_hybrid.src.eval.faithfulness import CitationVerificationResult
         from rag_hybrid.src.retriever.hybrid import DocumentChunk
 
+        monkeypatch.setenv("GROQ_API_KEY", "fake-key")
+        monkeypatch.setenv("GROQ_MODEL", "llama-3.3-70b-versatile")
         chunk = DocumentChunk(
             chunk_id="c1",
             doc_id="d1",
             text="Python is popular.",
             parent_text="Python is popular.",
+            source_name="paper.pdf",
+            page_number=3,
         )
         mock_rag.hybrid_retrieve.return_value = [chunk]
 
@@ -148,9 +152,31 @@ class TestQueryEndpoint:
         resp = client.post("/query", json={"query": "What is Python?"})
         assert resp.status_code == 200
         body = resp.json()
-        assert "answer" in body
-        assert "faithfulness_score" in body
-        assert "citations" in body
+        assert body["answer"] == "Python is popular."
+        assert body["answer_mode"] == "generated"
+        assert body["faithfulness_score"] == 1.0
+        assert body["citations"] == ["Chunk_c1"]
+        assert body["citation_details"] == [
+            {"citation": "Chunk_c1", "source_name": "paper.pdf", "page_number": 3}
+        ]
+        assert body["retrieved_sources"][0]["excerpt"] == "Python is popular."
+        assert body["cache_status"] == "miss"
+
+        repeated = client.post("/query", json={"query": "What is Python?"}).json()
+        assert repeated["cache_status"] == "hit"
+        assert repeated["citation_details"] == body["citation_details"]
+        assert set(repeated["latency_ms"]) == {"total"}
+        MockGroq.return_value.chat.completions.create.assert_called_once()
+        mock_eval.evaluate_generation.assert_called_once_with(
+            [{"claim": "Python is popular.", "citation": "Chunk_c1"}],
+            {"Chunk_c1": "Python is popular."},
+        )
+
+        mock_eval.evaluate_generation.side_effect = RuntimeError("NLI model unavailable")
+        response = client.post("/query", json={"query": "Describe Python."})
+        assert response.status_code == 200
+        assert response.json()["answer"] == body["answer"]
+        assert response.json()["faithfulness_score"] is None
 
     @patch("rag_hybrid.src.api.app._rag")
     @patch("rag_hybrid.src.api.app._evaluator")
@@ -180,10 +206,12 @@ class TestQueryEndpoint:
     @patch("rag_hybrid.src.api.app._rag")
     @patch("rag_hybrid.src.api.app._evaluator")
     @patch("rag_hybrid.src.generator.generator.Groq")
-    def test_faithfulness_score_in_range(self, MockGroq, mock_eval, mock_rag, client):
+    def test_faithfulness_score_in_range(self, MockGroq, mock_eval, mock_rag, client, monkeypatch):
         from rag_hybrid.src.eval.faithfulness import CitationVerificationResult
         from rag_hybrid.src.retriever.hybrid import DocumentChunk
 
+        monkeypatch.setenv("GROQ_API_KEY", "fake-key")
+        monkeypatch.setenv("GROQ_MODEL", "llama-3.3-70b-versatile")
         chunk = DocumentChunk(
             chunk_id="c1", doc_id="d1",
             text="Test.", parent_text="Test.",

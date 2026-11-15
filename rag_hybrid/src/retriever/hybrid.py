@@ -48,6 +48,39 @@ def _tokenize(text: str) -> list[str]:
     return re.findall(r"[\w]+", text.lower(), flags=re.UNICODE)
 
 
+class RetrievalModels:
+    """Lazily load model weights independently of an indexed paper library."""
+
+    def __init__(self, embedding_model: str, reranker_model: str):
+        self.embedding_model = embedding_model
+        self.reranker_model = reranker_model
+        self._dense_model: SentenceTransformerType | None = None
+        self._reranker: CrossEncoderType | None = None
+        self._lock = threading.RLock()
+
+    @property
+    def dense_model(self) -> SentenceTransformerType:
+        with self._lock:
+            if self._dense_model is None:
+                model_class = SentenceTransformer
+                if model_class is None:
+                    from sentence_transformers import SentenceTransformer as model_class
+
+                self._dense_model = model_class(self.embedding_model)
+            return self._dense_model
+
+    @property
+    def reranker(self) -> CrossEncoderType:
+        with self._lock:
+            if self._reranker is None:
+                model_class = CrossEncoder
+                if model_class is None:
+                    from sentence_transformers import CrossEncoder as model_class
+
+                self._reranker = model_class(self.reranker_model)
+            return self._reranker
+
+
 class ProductionHybridRAG:
     """Hybrid retriever backed by Qdrant or Pinecone.
 
@@ -67,6 +100,7 @@ class ProductionHybridRAG:
         qdrant_path: str | None = None,
         embedding_model: str | None = None,
         reranker_model: str | None = None,
+        models: RetrievalModels | None = None,
     ):
         self.vector_db = (vector_db or os.getenv("VECTOR_DB", "qdrant")).strip().lower()
         if self.vector_db not in {"qdrant", "pinecone"}:
@@ -77,14 +111,15 @@ class ProductionHybridRAG:
             if self.vector_db == "pinecone"
             else os.getenv("QDRANT_COLLECTION_NAME", "rag-hybrid")
         )
-        self.embedding_model_name = embedding_model or EMBEDDING_MODEL
-        self.reranker_model_name = reranker_model or RERANKER_MODEL
-        self._dense_model: SentenceTransformerType | None = None
-        self._reranker: CrossEncoderType | None = None
-        self._model_lock = threading.RLock()
+        self.models = models or RetrievalModels(
+            embedding_model or EMBEDDING_MODEL, reranker_model or RERANKER_MODEL
+        )
+        self.embedding_model_name = self.models.embedding_model
+        self.reranker_model_name = self.models.reranker_model
         self.bm25: BM25Okapi | None = None
         self.corpus_chunks: list[DocumentChunk] = []
         self._corpus_lock = threading.RLock()
+        self._corpus_revision = 0
 
         self.pinecone = None
         self.pinecone_index = None
@@ -100,26 +135,18 @@ class ProductionHybridRAG:
             self._initialize_qdrant(qdrant_url=qdrant_url, qdrant_path=qdrant_path)
 
     @property
-    def dense_model(self) -> SentenceTransformer:
-        with self._model_lock:
-            if self._dense_model is None:
-                model_class = SentenceTransformer
-                if model_class is None:
-                    from sentence_transformers import SentenceTransformer as model_class
-
-                self._dense_model = model_class(self.embedding_model_name)
-            return self._dense_model
+    def dense_model(self) -> SentenceTransformerType:
+        return self.models.dense_model
 
     @property
-    def reranker(self) -> CrossEncoder:
-        with self._model_lock:
-            if self._reranker is None:
-                model_class = CrossEncoder
-                if model_class is None:
-                    from sentence_transformers import CrossEncoder as model_class
+    def reranker(self) -> CrossEncoderType:
+        return self.models.reranker
 
-                self._reranker = model_class(self.reranker_model_name)
-            return self._reranker
+    @property
+    def corpus_revision(self) -> int:
+        """Read the library version after any concurrent index write finishes."""
+        with self._corpus_lock:
+            return self._corpus_revision
 
     def _initialize_qdrant(self, qdrant_url: str | None, qdrant_path: str | None) -> None:
         resolved_url = qdrant_url or os.getenv("QDRANT_URL")
@@ -228,6 +255,7 @@ class ProductionHybridRAG:
             raise ValueError("Document chunks must have non-empty IDs and searchable text")
 
         with self._corpus_lock:
+            self._corpus_revision += 1
             if new_chunks:
                 self._upsert_chunks(new_chunks)
             self.corpus_chunks = new_chunks
@@ -247,6 +275,7 @@ class ProductionHybridRAG:
         ):
             raise ValueError("Document chunks must have non-empty IDs and searchable text")
         with self._corpus_lock:
+            self._corpus_revision += 1
             self.corpus_chunks = restored
             self._build_bm25()
 
@@ -294,6 +323,7 @@ class ProductionHybridRAG:
             if not removed:
                 return []
 
+            self._corpus_revision += 1
             self._delete_chunks(removed)
             removed_ids = {chunk.chunk_id for chunk in removed}
             self.corpus_chunks = [
@@ -349,6 +379,7 @@ class ProductionHybridRAG:
                 for chunk in existing_by_source.get(key, {}).values()
                 if chunk.chunk_id not in new_ids
             ]
+            self._corpus_revision += 1
             self._upsert_chunks(to_upsert)
             self._delete_chunks(to_remove)
             self.corpus_chunks = [
@@ -375,6 +406,7 @@ class ProductionHybridRAG:
             if not added:
                 return []
 
+            self._corpus_revision += 1
             self._upsert_chunks(added)
             self.corpus_chunks.extend(added)
             self._build_bm25()

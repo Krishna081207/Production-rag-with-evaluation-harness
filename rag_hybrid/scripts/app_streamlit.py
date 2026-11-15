@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import logging
 import os
+import re
 import time
 from typing import Any
 
@@ -10,9 +12,14 @@ import requests
 import streamlit as st
 from dotenv import load_dotenv
 
+from rag_hybrid.src.generator.generator import CITATION_RE, without_citation_markers
+from rag_hybrid.src.paper_qa import PAPER_IMPLICATIONS_QUESTION, PAPER_OVERVIEW_QUESTION, PaperQA
+
 load_dotenv()
+logger = logging.getLogger(__name__)
 API_START_COMMAND = "python -m rag_hybrid.scripts.run_local"
-INLINE_PIPELINE_CACHE_VERSION = "generation-result-v2"
+INLINE_PIPELINE_CACHE_VERSION = "paper-qa-v1"
+DEMO_PAPER = "synthetic_demo_paper.pdf"
 
 for secret_name in ("GROQ_API_KEY", "GROQ_MODEL"):
     if not os.getenv(secret_name):
@@ -172,32 +179,28 @@ def upload_documents(base_url: str, files: list) -> dict[str, Any]:
     return response.json()
 
 
-@st.cache_resource(show_spinner="Loading local models…")
-def _load_inline_pipeline(cache_version: str):
-    """Load the RAG components once; cache_version invalidates stale deployed resources."""
-    from importlib import import_module, reload
+@st.cache_resource
+def _inline_retrieval_models():
+    from rag_hybrid.src.retriever.hybrid import EMBEDDING_MODEL, RERANKER_MODEL, RetrievalModels
 
-    FaithfulnessEvaluator = import_module(
-        "rag_hybrid.src.eval.faithfulness"
-    ).FaithfulnessEvaluator
-    generator = reload(import_module("rag_hybrid.src.generator.generator"))
-    extract_claims = generator.extract_claims
-    generate_answer = generator.generate_answer
-    retriever = import_module("rag_hybrid.src.retriever.hybrid")
-    DocumentChunk = retriever.DocumentChunk
-    ProductionHybridRAG = retriever.ProductionHybridRAG
+    return RetrievalModels(EMBEDDING_MODEL, RERANKER_MODEL)
 
-    rag = ProductionHybridRAG(vector_db="qdrant", qdrant_path=":memory:")
-    evaluator = (
-        FaithfulnessEvaluator()
-        if os.getenv("GROQ_API_KEY") or os.getenv("groq")
-        else None
+
+def _load_inline_pipeline(*, include_demo: bool = True) -> PaperQA:
+    """Share model weights while keeping each session's papers and answers together."""
+    if INLINE_PIPELINE_CACHE_VERSION in st.session_state:
+        return st.session_state[INLINE_PIPELINE_CACHE_VERSION]
+
+    from rag_hybrid.src.retriever.hybrid import DocumentChunk, ProductionHybridRAG
+
+    rag = ProductionHybridRAG(
+        vector_db="qdrant", qdrant_path=":memory:", models=_inline_retrieval_models()
     )
     demo_chunks = [
         DocumentChunk(
             chunk_id="demo_retrieval_p1_c0",
             doc_id="demo_retrieval",
-            source_name="synthetic_demo_paper.pdf",
+            source_name=DEMO_PAPER,
             page_number=1,
             text="Research question: Does combining dense semantic retrieval and BM25 improve evidence retrieval for a research assistant?",
             parent_text="Research question: Does combining dense semantic retrieval and BM25 improve evidence retrieval for a research assistant? The synthetic demonstration compares retrieval methods.",
@@ -205,7 +208,7 @@ def _load_inline_pipeline(cache_version: str):
         DocumentChunk(
             chunk_id="demo_retrieval_p2_c0",
             doc_id="demo_retrieval",
-            source_name="synthetic_demo_paper.pdf",
+            source_name=DEMO_PAPER,
             page_number=2,
             text="Method: The synthetic study compares BM25, dense retrieval, and reciprocal rank fusion using Recall@5 on manually labeled questions.",
             parent_text="Method: The synthetic study compares BM25, dense retrieval, and reciprocal rank fusion using Recall@5 on manually labeled questions. This example contains no real experimental results.",
@@ -213,66 +216,37 @@ def _load_inline_pipeline(cache_version: str):
         DocumentChunk(
             chunk_id="demo_retrieval_p3_c0",
             doc_id="demo_retrieval",
-            source_name="synthetic_demo_paper.pdf",
+            source_name=DEMO_PAPER,
             page_number=3,
             text="Limitation: Results from a small synthetic example cannot establish how retrieval methods perform across scientific fields or full-length papers.",
             parent_text="Limitation: Results from a small synthetic example cannot establish how retrieval methods perform across scientific fields or full-length papers.",
         ),
     ]
-    rag.index_documents(demo_chunks)
-    return rag, evaluator, generate_answer, extract_claims
+    if include_demo:
+        rag.index_documents(demo_chunks)
+    paper_qa = PaperQA(rag, _evaluate_inline)
+    st.session_state[INLINE_PIPELINE_CACHE_VERSION] = paper_qa
+    return paper_qa
+
+
+@st.cache_resource(show_spinner=False)
+def _load_inline_evaluator():
+    from rag_hybrid.src.eval.faithfulness import FaithfulnessEvaluator
+
+    return FaithfulnessEvaluator()
+
+
+def _evaluate_inline(claims: list[dict[str, str]], evidence: dict[str, str]):
+    try:
+        return _load_inline_evaluator().evaluate_generation(claims, evidence)
+    except Exception:
+        logger.exception("Could not run citation checks for the inline answer")
+        return None
 
 
 def call_inline(query: str, top_k: int) -> dict[str, Any]:
-    rag, evaluator, generate_answer, extract_claims = _load_inline_pipeline(
-        INLINE_PIPELINE_CACHE_VERSION
-    )
-    st.session_state.inline_pipeline_loaded = True
     retrieval_mode = os.getenv("RAG_INLINE_RETRIEVAL_MODE", "hybrid_rerank")
-    retrieved = rag.hybrid_retrieve(
-        query, top_candidates=10, final_k=top_k, mode=retrieval_mode
-    )
-    generation = generate_answer(query, retrieved)
-    retrieved_map = {
-        key: chunk.text
-        for chunk in retrieved
-        for key in (chunk.chunk_id, f"Chunk_{chunk.chunk_id}")
-    }
-    claims = extract_claims(generation.answer)
-    evaluation = (
-        evaluator.evaluate_generation(claims, retrieved_map)
-        if generation.mode == "generated" and evaluator is not None
-        else None
-    )
-    chunks_by_citation = {f"Chunk_{chunk.chunk_id}": chunk for chunk in retrieved}
-    return {
-        "answer": generation.answer,
-        "answer_mode": generation.mode,
-        "citations": generation.citations,
-        "citation_details": [
-            {
-                "citation": citation,
-                "source_name": chunks_by_citation[citation].source_name
-                or chunks_by_citation[citation].doc_id,
-                "page_number": chunks_by_citation[citation].page_number,
-            }
-            for citation in generation.citations
-            if citation in chunks_by_citation
-        ],
-        "faithfulness_score": evaluation.faithfulness_score if evaluation else None,
-        "violations": evaluation.violations or None if evaluation else None,
-        "fallback_reason": getattr(generation, "fallback_reason", None),
-        "latency_ms": {},
-        "retrieved_sources": [
-            {
-                "citation": f"Chunk_{chunk.chunk_id}",
-                "source_name": chunk.source_name or chunk.doc_id,
-                "page_number": chunk.page_number,
-                "excerpt": chunk.text,
-            }
-            for chunk in retrieved
-        ],
-    }
+    return _load_inline_pipeline().answer(query, top_k, mode=retrieval_mode)
 
 
 def index_inline_documents(files: list) -> dict[str, Any]:
@@ -283,8 +257,6 @@ def index_inline_documents(files: list) -> dict[str, Any]:
     chunk_document_segments = ingestion.chunk_document_segments
     read_document_segments = ingestion.read_document_segments
 
-    rag, _, _, _ = _load_inline_pipeline(INLINE_PIPELINE_CACHE_VERSION)
-    st.session_state.inline_pipeline_loaded = True
     chunks = []
     names = []
     for file in files:
@@ -294,8 +266,39 @@ def index_inline_documents(files: list) -> dict[str, Any]:
             raise ValueError(f"{file.name}: document contains no indexable text")
         names.append(file.name)
         chunks.extend(document_chunks)
+    rag = _load_inline_pipeline(include_demo=False).rag
     added = rag.replace_sources(chunks)
+    if any(chunk.doc_id == "demo_retrieval" for chunk in rag.corpus_chunks):
+        rag.remove_sources([DEMO_PAPER])
     return {"files": names, "chunks_indexed": len(added), "total_chunks": len(rag.corpus_chunks)}
+
+
+def _source_label(source: dict[str, Any]) -> str:
+    name = source.get("source_name") or "Paper"
+    label = re.sub(r"([\\`*_\[\]<>])", r"\\\1", name)
+    page = source.get("page_number")
+    return f"{label}, p. {page}" if page is not None else label
+
+
+def _paper_references(
+    citations: list[str], result: dict[str, Any]
+) -> list[tuple[str, list[str]]]:
+    """Group cited passages by file and page in citation order."""
+    sources = {}
+    for items in (result.get("retrieved_sources"), result.get("citation_details")):
+        for item in items or []:
+            citation = item.get("citation")
+            if citation:
+                sources.setdefault(citation, {}).update(item)
+
+    references: dict[tuple[str, int | None], tuple[str, list[str]]] = {}
+    for citation in citations:
+        source = sources.get(citation, {})
+        location = (source.get("source_name") or citation, source.get("page_number"))
+        _, excerpts = references.setdefault(location, (_source_label(source), []))
+        if (excerpt := source.get("excerpt")) and excerpt not in excerpts:
+            excerpts.append(excerpt)
+    return list(references.values())
 
 
 def render_assistant_message(message: dict[str, Any], show_violations: bool) -> None:
@@ -307,32 +310,9 @@ def render_assistant_message(message: dict[str, Any], show_violations: bool) -> 
             st.code(API_START_COMMAND, language="powershell")
         return
 
-    if result.get("answer_mode") == "extractive":
-        fallback_reason = result.get("fallback_reason")
-        if fallback_reason == "provider_error":
-            st.info(
-                "Groq couldn't complete the answer request. Showing a cited answer from the "
-                "retrieved paper text. Check the Streamlit app logs for the provider error."
-            )
-        elif fallback_reason == "citation_validation_error":
-            st.info(
-                "Groq's answer still lacked valid citations after a retry. Showing a cited "
-                "answer selected from the retrieved paper text."
-            )
-        elif fallback_reason == "no_api_key" or not (
-            os.getenv("GROQ_API_KEY") or os.getenv("groq")
-        ):
-            st.info(
-                "No answer-generation model is configured. This cited answer is selected from "
-                "the paper text that matched your question. Set GROQ_API_KEY for a generated answer."
-            )
-        else:
-            st.info(
-                "A validated model answer wasn't available. Showing a cited answer selected "
-                "from the retrieved paper text. Check the Streamlit app logs for details."
-            )
-    st.markdown(result.get("answer", "No answer returned."))
+    answer = result.get("answer", "No answer returned.")
     if message.get("source_mode") == "Web search":
+        st.markdown(answer)
         sources = result.get("sources", [])
         st.caption(f"Web search · {len(sources)} source(s) · {message['elapsed']:.2f}s")
         for index, source in enumerate(sources, start=1):
@@ -342,48 +322,45 @@ def render_assistant_message(message: dict[str, Any], show_violations: bool) -> 
                 st.caption(source["content"])
         return
 
-    faithfulness = result.get("faithfulness_score")
-    citations = result.get("citations", [])
-    metric1, metric2, metric3 = st.columns(3)
-    metric1.metric("Evidence support", f"{faithfulness:.0%}" if faithfulness is not None else "N/A")
-    metric2.metric("Citations", len(citations))
-    metric3.metric("Answer time", f"{message['elapsed']:.2f}s")
+    citations = result.get("citations") or [f"Chunk_{id_}" for id_ in CITATION_RE.findall(answer)]
+    references = _paper_references(citations, result)
+    st.markdown(without_citation_markers(answer))
+    if result.get("answer_mode") == "extractive":
+        if result.get("fallback_reason") == "no_api_key":
+            st.caption("Passages from the papers · Set GROQ_API_KEY to enable synthesized explanations.")
+        else:
+            st.caption("Passages from the papers · A synthesized explanation is currently unavailable.")
 
-    details = result.get("citation_details") or []
-    if details:
-        labels = []
-        for item in details:
-            label = item.get("source_name") or item.get("citation", "Source")
-            if item.get("page_number") is not None:
-                label += f", p. {item['page_number']}"
-            if item.get("citation"):
-                label += f" ({item['citation']})"
-            labels.append(label)
-        st.markdown("**📎 Paper sources**")
-        for label in labels:
-            st.markdown(f"- {label}")
-    elif citations:
-        st.caption("Citations: " + " · ".join(citations))
+    if references:
+        st.markdown("**Sources**")
+        for label, excerpts in references:
+            if excerpts:
+                with st.expander(label):
+                    for excerpt in excerpts:
+                        st.text(excerpt)
+            else:
+                st.markdown(label)
 
-    retrieved_sources = result.get("retrieved_sources") or []
-    if retrieved_sources:
-        with st.expander(
-            f"Retrieved paper passages ({len(retrieved_sources)})",
-            expanded=result.get("answer_mode") == "extractive",
-        ):
-            for source in retrieved_sources:
-                label = source.get("source_name") or "Paper"
-                if source.get("page_number") is not None:
-                    label += f", p. {source['page_number']}"
-                if source.get("citation"):
-                    label += f" · {source['citation']}"
-                st.markdown(f"**{label}**")
+    cited = set(citations)
+    other_passages = [
+        source for source in result.get("retrieved_sources") or []
+        if source.get("citation") not in cited
+    ]
+    if other_passages:
+        with st.expander(f"Other retrieved passages ({len(other_passages)})"):
+            for source in other_passages:
+                st.markdown(f"**{_source_label(source)}**")
                 st.text(source.get("excerpt", ""))
 
-    timings = result.get("latency_ms") or {}
-    if timings:
-        with st.expander("Latency details"):
-            st.caption(" · ".join(f"{name}: {value:.0f} ms" for name, value in timings.items()))
+    with st.expander("Answer details"):
+        faithfulness = result.get("faithfulness_score")
+        if faithfulness is not None:
+            st.caption(f"Evidence support {faithfulness:.0%}")
+        st.caption(f"Answer time {message['elapsed']:.2f}s")
+        if result.get("cache_status") == "hit":
+            st.caption("Reused an answer for this paper library")
+        if timings := result.get("latency_ms"):
+            st.caption(" · ".join(f"{name} {value:.0f} ms" for name, value in timings.items()))
 
     if show_violations and result.get("violations"):
         with st.expander("Citation checks", expanded=False):
@@ -500,12 +477,12 @@ with st.sidebar:
         else:
             st.warning("FastAPI is unavailable. Start the local services to view and upload your library.")
             st.code(API_START_COMMAND, language="powershell")
-    elif st.session_state.get("inline_pipeline_loaded"):
-        inline_rag, _, _, _ = _load_inline_pipeline(INLINE_PIPELINE_CACHE_VERSION)
+    elif INLINE_PIPELINE_CACHE_VERSION in st.session_state:
+        inline_rag = _load_inline_pipeline().rag
         inline_counts: dict[str, int] = {}
         for chunk in inline_rag.corpus_chunks:
             source_name = chunk.source_name or chunk.doc_id
-            if source_name != "synthetic_demo_paper.pdf":
+            if chunk.doc_id != "demo_retrieval":
                 inline_counts[source_name] = inline_counts.get(source_name, 0) + 1
         st.caption(
             f"Temporary inline uploads: {sum(inline_counts.values())} chunks from "
@@ -590,12 +567,6 @@ if index_uploads and uploaded_files:
     except Exception as exc:
         st.sidebar.error(f"Indexing failed: {exc}")
 
-if not st.session_state.messages:
-    st.markdown(
-        "Ask a question to get started. Try *“What problem does this paper address?”* or "
-        "*“What evidence supports its main result?”*"
-    )
-
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
         if message["role"] == "user":
@@ -604,7 +575,14 @@ for message in st.session_state.messages:
             render_assistant_message(message, show_violations)
 
 placeholder = "Search the web…" if search_mode == "Web search" else "Ask about your papers…"
-prompt = st.chat_input(placeholder)
+quick_question = None
+if search_mode == "Indexed papers":
+    overview, implications = st.columns(2)
+    if overview.button(PAPER_OVERVIEW_QUESTION, use_container_width=True):
+        quick_question = PAPER_OVERVIEW_QUESTION
+    if implications.button(PAPER_IMPLICATIONS_QUESTION, use_container_width=True):
+        quick_question = PAPER_IMPLICATIONS_QUESTION
+prompt = st.chat_input(placeholder) or quick_question
 
 if prompt and prompt.strip():
     query = prompt.strip()
@@ -617,9 +595,8 @@ if prompt and prompt.strip():
         new_message["error"] = "Web search requires the API (FastAPI) backend. Select it in Settings."
     else:
         if search_mode == "Indexed papers" and backend == "API (FastAPI)":
-            readiness = call_readiness(api_url)
-            if readiness and not readiness.get("models_ready", False):
-                if readiness.get("model_warmup_status") == "failed":
+            if library_status and not library_status.get("models_ready", False):
+                if library_status.get("model_warmup_status") == "failed":
                     st.info("Background model warmup failed. This request may load models on demand; check the API terminal for details.")
                 else:
                     st.info("Retrieval models are still warming up. The first answer may take longer.")

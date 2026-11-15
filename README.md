@@ -37,7 +37,7 @@ python -m pip install -e ".[dev]"
 Copy-Item .env.example .env
 ```
 
-Edit `.env` and set a long random `ADMIN_API_KEY` to enable uploads. Set `GROQ_API_KEY` for synthesized answers; without it, the application returns up to three query-relevant cited paper sentences and the chat exposes the retrieved passage text with its chunk and page reference. The default local setup uses Qdrant at `rag_hybrid/data/qdrant` and saves the sparse corpus under `rag_hybrid/data/`.
+Edit `.env` and set a long random `ADMIN_API_KEY` to enable uploads. Set `GROQ_API_KEY` for synthesized explanations. When synthesis is unavailable, the app can show up to three relevant sentences from the papers. The default local setup uses Qdrant at `rag_hybrid/data/qdrant` and saves the sparse corpus under `rag_hybrid/data/`.
 
 The chat UI can search either your indexed papers or the public web. For web search, set `TAVILY_API_KEY` in `.env`; web queries are sent to Tavily only when **Web search** is selected. The [Tavily Search API](https://docs.tavily.com/documentation/api-reference/endpoint/search) returns an answer with linked source snippets. Retrieval models load in the background after API startup, and the UI shows retrieval, generation, and evidence-check timing for paper answers.
 
@@ -56,7 +56,9 @@ Open <http://localhost:8501>, upload a paper, and ask a question such as:
 - What are the main findings, and which measurements support them?
 - What limitations do the authors acknowledge?
 
-PDF citations include page numbers. DOCX, Markdown, and text sources are cited by file and chunk; these formats do not provide stable page locations.
+Paper answers appear as plain prose. Expand a source to read its cited passages. PDF sources identify the file and page. DOCX, Markdown, and plain-text sources identify the file.
+
+Use **What does this PDF tell me?** for an overview and **What is this leading to?** for implications or future work. Common phrasings of each question reuse the same answer for the current paper library. Repeat custom questions can also reuse their answers. The assistant says when the indexed papers lack enough evidence to answer.
 
 ## Ingest from a directory
 
@@ -91,7 +93,9 @@ curl.exe -X POST http://localhost:8000/query `
   -d '{"query":"What are the paper’s main contributions?"}'
 ```
 
-The response includes the answer, chunk citations, file/page details, an evidence-support score, and any unsupported-claim notes. The NLI score is an automated estimate and should be checked against the cited passage for consequential use.
+The `answer` field contains plain prose. The response also includes citation IDs and file/page details, an evidence-support score, and any unsupported-claim notes. The NLI score is an automated estimate and should be checked against the cited passage for consequential use.
+
+`cache_status` reports whether the query computed an answer (`miss`), reused a previous answer (`hit`), or waited for an identical request already in progress (`shared`). Each library keeps up to 128 answers in memory for 15 minutes. Uploads, replacements, and deletions invalidate those answers. Cache hits skip retrieval, generation, and evidence scoring, so their `latency_ms` contains only the current request's total time.
 
 Optional public web search is available at `POST /web-search` when `TAVILY_API_KEY` is configured. It returns an answer and a list of source titles, URLs, and snippets. `/ready` also reports whether background retrieval-model warmup has completed.
 
@@ -137,7 +141,7 @@ Compose persists the local Qdrant database and corpus in the `rag_data` volume. 
 
 For a no-cost demo, deploy `streamlit_app.py` from the `main` branch of this public GitHub repository at [Streamlit Community Cloud](https://share.streamlit.io/). The root-level entry point runs the Streamlit UI and RAG pipeline in one process, so it does not need the paid Render API service or persistent disk. The previous nested entry path, `rag_hybrid/scripts/app_streamlit_cloud.py`, remains as a compatibility wrapper for deployments whose Cloud setting has not been updated yet. Both entry points execute the shared UI file directly, avoiding package-import recursion. The Cloud requirements install CPU-only PyTorch to avoid downloading unused CUDA libraries, and inline retrieval uses dense + BM25 fusion without loading the extra cross-encoder model. Streamlit Community Cloud is free, but apps hibernate after 12 hours without traffic and have limited resources ([limits and hibernation](https://docs.streamlit.io/deploy/streamlit-community-cloud/manage-your-app)).
 
-Choose Python 3.12 in Advanced settings. To enable generated answers, add `GROQ_API_KEY` and optionally `GROQ_MODEL` in Streamlit's Secrets settings; never commit these values. Upload papers after launch. The free demo keeps its Qdrant index in memory, so uploaded papers disappear when the app restarts or wakes after hibernation. This deployment is suitable for trying the app, not for a durable shared research library. It disables Web search and the separate FastAPI backend. For persisted papers and a private API, use the paid Render Blueprint above.
+Choose Python 3.12 in Advanced settings. To enable generated answers, add `GROQ_API_KEY` and optionally `GROQ_MODEL` in Streamlit's Secrets settings. Keep these values out of version control. The free demo keeps each browser session's papers and answer cache in memory. The first upload replaces the sample paper in that session. Uploaded papers disappear when the session ends or the app restarts. The demo disables Web search and the separate FastAPI backend. For persisted papers and a private API, use the paid Render Blueprint above.
 
 ## Production deployment (Render)
 
